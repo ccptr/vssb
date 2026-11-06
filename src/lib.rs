@@ -23,6 +23,9 @@
 //! children can't be reaped by the host's `waitpid(-1)`. See README.md
 //! for the guarantees and how they are kept.
 
+// libc's rlimit and flag types differ between glibc and musl.
+#![allow(clippy::unnecessary_cast)]
+
 #[cfg(not(target_os = "linux"))]
 compile_error!("vssb only supports Linux");
 

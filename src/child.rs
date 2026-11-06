@@ -35,6 +35,15 @@ pub(crate) const FORWARDED: [i32; 10] = [
 
 const SI_KERNEL: i32 = 0x80;
 
+/// The kernel's struct sigaction (not glibc's).
+#[repr(C)]
+struct KernelSigaction {
+    handler: libc::sighandler_t,
+    flags: u64,
+    restorer: usize,
+    mask: u64,
+}
+
 fn exit(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
@@ -47,9 +56,11 @@ fn report(fd: i32, r: Report) {
 /// blocked them around clone, so no handler of the caller's can run here.
 pub(crate) fn pid1(p: &mut Prepared) -> ! {
     // Handlers are the caller's code; ignored signals would survive exec.
+    // (Raw syscalls: glibc's sigaction takes a lock another thread may hold.)
+    let dfl = KernelSigaction { handler: libc::SIG_DFL, flags: 0, restorer: 0, mask: 0 };
     for sig in 1..=64 {
         if sig != libc::SIGKILL && sig != libc::SIGSTOP {
-            unsafe { libc::signal(sig, libc::SIG_DFL) };
+            unsafe { libc::syscall(libc::SYS_rt_sigaction, sig, &dfl as *const KernelSigaction, std::ptr::null::<KernelSigaction>(), 8usize) };
         }
     }
     close_others(&p.keep_fds);
@@ -309,8 +320,8 @@ fn run_program(p: &mut Prepared) -> (i32, Report) {
     {
         return (EXIT_SETUP, r);
     }
-    let empty = sigset(&[]);
-    unsafe { libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) };
+    let empty: u64 = 0;
+    unsafe { libc::syscall(libc::SYS_rt_sigprocmask, libc::SIG_SETMASK, &empty as *const u64, std::ptr::null::<u64>(), 8usize) };
 
     // Last step before exec: from here on the filter applies.
     if let Err(e) = seccomp::install(&p.seccomp) {

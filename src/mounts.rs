@@ -85,6 +85,12 @@ fn open_component(dir: i32, name: &CStr) -> Result<i32, i32> {
     chk_fd(unsafe { libc::syscall(libc::SYS_openat2, dir, name.as_ptr(), &how as *const libc::open_how, std::mem::size_of::<libc::open_how>()) })
 }
 
+fn file_type(fd: i32) -> Result<u32, i32> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    chk(unsafe { libc::fstat(fd, &mut st) } as i64)?;
+    Ok(st.st_mode & libc::S_IFMT)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Dir,
@@ -157,7 +163,12 @@ fn ensure(root: i32, mounts: &[PMount], regions: &[u8], i: usize, upto: usize, k
         };
         close(cur);
         cur = fd;
-        let dir = is_dir(fd).map_err(|e| Report::with(report::OPEN_PATH, e, ix, depth, report::NONE))?;
+        // O_PATH|O_NOFOLLOW opens a final symlink instead of failing.
+        let mode = file_type(fd).map_err(|e| Report::with(report::OPEN_PATH, e, ix, depth, report::NONE))?;
+        if mode == libc::S_IFLNK {
+            return Err(Report::with(report::SYMLINK_IN_PATH, libc::ELOOP, ix, depth, report::NONE));
+        }
+        let dir = mode == libc::S_IFDIR;
         match want {
             Kind::Dir if !dir => return Err(Report::with(report::NOT_DIR, libc::ENOTDIR, ix, depth, report::NONE)),
             Kind::File if dir => return Err(Report::new(report::IS_DIR, libc::EISDIR, ix)),
