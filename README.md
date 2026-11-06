@@ -1,6 +1,6 @@
 # vssb
 
-The sandbox core of [vsmp](../vsmp) as a library you can embed: run a
+The sandbox core of [vsmr](../vsmr) as a library you can embed: run a
 program in a rootless Linux sandbox (namespaces, Landlock, seccomp, cgroup
 limits) from inside another program, such as a game launcher, an agent
 harness or a build tool. It needs no root, no daemon and no helper binary.
@@ -26,7 +26,7 @@ let status = child.wait()?;
 
 ## What a sandbox enforces
 
-The same layers as vsmp:
+The same layers as vsmr:
 
 | Layer | Mechanism | What it does |
 |---|---|---|
@@ -40,7 +40,7 @@ The same layers as vsmp:
 
 ## What makes it embeddable
 
-vsmp is a CLI, so it could take over its process. A library can't. These
+vsmr is a CLI, so it could take over its process. A library can't. These
 are the guarantees towards the host, each with an integration test in
 `tests/sandbox.rs`:
 
@@ -57,7 +57,7 @@ are the guarantees towards the host, each with an integration test in
   for the moment of clone), and no re-execution of the host. Limits come
   from asking the systemd user manager over D-Bus (`busctl`) to move the
   waiting child into a new scope, rather than re-running the host under
-  `systemd-run` as vsmp does.
+  `systemd-run` as vsmr does.
 - **Your `waitpid(-1)` can't steal it.** The sandbox is a "clone child"
   (no exit signal): it sends no SIGCHLD and only `__WALL` waits see it.
   `Child` waits on its pidfd, which can also go into your poll loop or
@@ -114,10 +114,10 @@ are the guarantees towards the host, each with an integration test in
   through a callback and stops cleanly. It is the only part that starts
   threads.
 
-## Not here (they stay in vsmp)
+## Not here (they stay in vsmr)
 
 Policy files, path expansion (`~`, `$PWD`), Cargo dependency detection, the
-audit log format and the CLI are front-end concerns. vsmp can be rebuilt
+audit log format and the CLI are front-end concerns. vsmr can be rebuilt
 on top of this crate: its `Plan` maps onto `Sandbox` + `Command`, and its
 `proxy` and `audit` onto `proxy::serve` with an event callback.
 
@@ -134,7 +134,7 @@ on top of this crate: its `Plan` maps onto `Sandbox` + `Command`, and its
 - If your process forks without exec while a spawn is in flight, the
   forked copy keeps the control socket open, so `spawn` waits until that
   copy exits or execs. `std::process` has the same property.
-- The security notes in vsmp's README apply unchanged: writable
+- The security notes in vsmr's README apply unchanged: writable
   directories are an exit, the proxy filters by name, the kernel is shared.
 
 ## Tests

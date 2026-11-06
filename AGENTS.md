@@ -1,6 +1,6 @@
 # vssb: notes for agents
 
-Embeddable rootless Linux sandbox: vsmp's core as a library. See
+Embeddable rootless Linux sandbox: vsmr's core as a library. See
 README.md for the design and the guarantees towards the host program.
 
 ## Layout
@@ -40,7 +40,7 @@ README.md for the design and the guarantees towards the host program.
 - seccomp jumps are 8-bit: keep the final ALLOW reachable, and keep
   `seccomp::tests` passing.
 - The core knows nothing about particular programs. Front-end concerns
-  (policy files, detection, audit format) belong in vsmp.
+  (policy files, detection, audit format) belong in vsmr.
 
 ## Testing
 
