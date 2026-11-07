@@ -518,12 +518,21 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
         Cgroup::Auto => CgroupPlan::Scope { unit: format!("vssb-{id}.scope"), required: false },
         Cgroup::SystemdUserScope => CgroupPlan::Scope { unit: format!("vssb-{id}.scope"), required: true },
         Cgroup::Join(path) => {
-            cgroup::write_limits(path, &cg_limits);
             let f = File::options()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
                 .open(path)
                 .map_err(|e| Error::io(format!("opening cgroup {}", path.display()), e))?;
+            // Checked before writing limits, which would otherwise create
+            // files such as memory.max in an ordinary directory.
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatfs(f.as_raw_fd(), &mut st) } < 0 {
+                return Err(Error::io(format!("cgroup {}", path.display()), io::Error::last_os_error()));
+            }
+            if st.f_type != libc::CGROUP2_SUPER_MAGIC {
+                return Err(Error::Config(format!("{} is not a cgroup v2 directory", path.display())));
+            }
+            cgroup::write_limits(path, &cg_limits);
             CgroupPlan::Join { fd: above_stdio(f.into())?, path: path.clone() }
         }
     };

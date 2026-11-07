@@ -956,6 +956,65 @@ fn limits_that_need_a_cgroup_are_config_errors_without_one() {
     assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))));
 }
 
+#[test]
+fn joining_a_directory_that_is_not_a_cgroup_is_refused() {
+    let d = Dir::new();
+    let target = Dir::new();
+    let mut sb = sandbox(&d);
+    sb.cgroup(Cgroup::Join(target.0.clone())).limits(Limits { memory: Some(64 << 20), pids: Some(32), ..Default::default() });
+    match sb.spawn(sh(&d, "true")) {
+        Err(Error::Config(m)) => assert!(m.contains("not a cgroup v2 directory"), "{m}"),
+        r => panic!("{:?}", r.map(|_| ())),
+    }
+    // Nothing written into it (memory.max and the like).
+    assert!(std::fs::read_dir(&target.0).unwrap().next().is_none());
+}
+
+/// Runs in a delegated systemd scope (the test re-runs itself there): the
+/// sandbox starts in the given cgroup, and the limits are written to it.
+#[test]
+fn joins_a_given_cgroup() {
+    const INSIDE: &str = "VSSB_TEST_IN_DELEGATED_SCOPE";
+    if std::env::var_os(INSIDE).is_none() {
+        let st = std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "-q", "-p", "Delegate=yes", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "joins_a_given_cgroup", "--test-threads=1"])
+            .env(INSIDE, "1")
+            .stdout(std::process::Stdio::null())
+            .status();
+        match st {
+            Ok(s) if s.code() == Some(0) => {}
+            // No user manager (systemd-run fails before running anything).
+            Ok(s) if !vssb::probe().systemd_user => eprintln!("skipped: no systemd user manager ({s})"),
+            r => panic!("inside the scope: {r:?}"),
+        }
+        return;
+    }
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let cg = PathBuf::from(format!("/sys/fs/cgroup{}", own.lines().find_map(|l| l.strip_prefix("0::")).unwrap()));
+    // A cgroup with processes can't hand controllers down: move this
+    // process to a leaf first.
+    std::fs::create_dir(cg.join("harness")).unwrap();
+    std::fs::write(cg.join("harness/cgroup.procs"), std::process::id().to_string()).unwrap();
+    std::fs::write(cg.join("cgroup.subtree_control"), "+memory +pids").unwrap();
+    let target = cg.join("sandbox");
+    std::fs::create_dir(&target).unwrap();
+
+    let d = Dir::new();
+    let mut sb = sandbox(&d);
+    sb.cgroup(Cgroup::Join(target.clone())).limits(Limits { memory: Some(64 << 20), pids: Some(32), ..Default::default() });
+    let mut child = sb.spawn(sh(&d, "sleep 30")).expect("spawn");
+    assert_eq!(child.enforcement().memory, Some(vssb::Via::Cgroup));
+    assert_eq!(child.enforcement().pids, Some(vssb::Via::Cgroup));
+    let procs = std::fs::read_to_string(target.join("cgroup.procs")).unwrap();
+    assert!(procs.lines().any(|p| p == child.id().to_string()), "{procs}");
+    assert_eq!(std::fs::read_to_string(target.join("memory.max")).unwrap().trim(), (64 << 20).to_string());
+    assert_eq!(std::fs::read_to_string(target.join("pids.max")).unwrap().trim(), "32");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 /// The program's CPU list and whether it may widen it to every CPU.
 fn affinity(sb: &Sandbox, d: &Dir) -> (vssb::Via, String) {
     let code = "import os\n\
