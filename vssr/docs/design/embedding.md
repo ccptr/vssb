@@ -81,12 +81,16 @@ What already works:
   `kill_grace`, then sends SIGKILL.
 - `VSSR_ID` chooses the sandbox id, which ties audit events to the
   client's own launch id.
-- `--audit-log /proc/self/fd/3` streams JSON-lines events to a pipe the
-  client holds: `setup_failed`, `start` (with the host pid), `net`,
-  `net_close`, `signal`, `timeout`, `exit`. `start` is written once the
-  program has been exec'd, so it serves as a ready event; a setup
-  failure writes `setup_failed` instead, so it can't be mistaken for a
-  game that exits with 125.
+- `--audit-fd 3` streams JSON-lines events to a pipe the client holds:
+  `note`, `setup_failed`, `start` (with the host pid), `warning`, `net`,
+  `net_close`, `signal`, `timeout`, `error`, `exit` (listed in the
+  README). `start` is written once the program has been exec'd, so it
+  serves as a ready event; a setup failure writes `setup_failed`
+  instead, so it can't be mistaken for a game that exits with 125.
+  (`--audit-log /proc/self/fd/3` no longer works: the log path refuses
+  symlinks and anything but a regular file.)
+- `--quiet` keeps vssr's messages off stderr; they are events instead.
+- `-p /proc/self/fd/N` reads the policy from a pipe the client holds.
 - Several sandboxes can run at once, each in its own namespaces.
 
 Gaps, roughly by importance:
@@ -103,13 +107,7 @@ Gaps, roughly by importance:
    vssr always tries a systemd user scope (falling back to pinning and
    the PID namespace for cpus and pids). Suggestion: `--cgroup PATH`
    (it also avoids the `busctl` subprocess).
-4. **stderr noise.** "vssr: blocked …", detection notes and warnings are
-   mixed into the game's stderr. `audit.quiet` silences only the
-   blocked-request lines. Suggestion: a flag that sends all of vssr's
-   messages to the event stream.
-5. **Policy only from a file or flags.** `-p /proc/self/fd/N` works but
-   isn't documented. Document it or add `--policy-fd`.
-6. **Defaults meant for an agent in a project.** The default policy
+4. **Defaults meant for an agent in a project.** The default policy
    runs the `cargo` detector on the working directory and refuses a
    working directory that contains `$HOME`. Game policies should set
    `detect.enable = []`, and the client should always pass `-p`.
@@ -141,10 +139,9 @@ left behind, freezing a paused game, and the audit trail.
 
 1. **Integration contract for `vssr run`** (small; useful to every
    embedder, not only games): `--pass-fd`, `--cgroup`, `--json` for
-   `check` and `--dry-run`, a flag that sends all of vssr's messages to
-   the event stream, and documenting `-p /proc/self/fd/N` and `start` as
-   the ready event. One integration test per guarantee, as AGENTS.md
-   asks.
+   `check` and `--dry-run`. One integration test per guarantee, as
+   AGENTS.md asks. (Done: `--audit-fd`, `--quiet`, and documenting
+   `-p /proc/self/fd/N` and `start` as the ready event.)
 2. **Limits without a subprocess**: create the scope over D-Bus from
    vssb itself instead of running `busctl`, so a host's `waitpid(-1)`
    can't interfere.

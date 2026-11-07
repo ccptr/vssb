@@ -1,5 +1,7 @@
-//! Audit log: one JSON object per line, appended to a file. Every event
-//! carries the sandbox id so concurrent runs can share one log.
+//! Audit log: one JSON object per line, appended to a file or written to a
+//! descriptor the caller passed in. Every event carries the sandbox id so
+//! concurrent runs can share one log. vssr's own messages are events too;
+//! `say` also prints them to stderr unless the run is quiet.
 
 use crate::util::resolve_guarded_prefix;
 use anyhow::{Context, Result, bail};
@@ -7,7 +9,7 @@ use serde_json::{Map, Value, json};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -16,17 +18,52 @@ use std::time::SystemTime;
 pub struct Audit {
     file: Mutex<Option<File>>,
     pub id: String,
-    /// Print blocked network requests to stderr.
-    pub notify: bool,
+    /// Messages go to the log only, not to stderr.
+    pub quiet: bool,
 }
 
 impl Audit {
     /// Opens (creates) the log for appending. `writable` are the plan's
     /// writable directories: the log may well be in one, so no symlink
     /// there is followed, and only a regular file is written to.
-    pub fn open(path: Option<&Path>, writable: &[PathBuf], id: String, notify: bool) -> Result<Audit> {
+    pub fn open(path: Option<&Path>, writable: &[PathBuf], id: String, quiet: bool) -> Result<Audit> {
         let file = path.map(|p| open_log(p, writable).with_context(|| format!("audit log {}", p.display()))).transpose()?;
-        Ok(Audit { file: Mutex::new(file), id, notify })
+        Ok(Audit { file: Mutex::new(file), id, quiet })
+    }
+
+    /// Writes events to `fd`, a descriptor the caller passed in (a pipe,
+    /// socket or file). No path is involved, so nothing the sandbox planted
+    /// can redirect it. vssr writes to its own copy; the caller's
+    /// descriptor is left open (the sandbox's init closes it).
+    pub fn from_fd(fd: RawFd, id: String, quiet: bool) -> Result<Audit> {
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if fl < 0 {
+            return Err(os_err(&format!("descriptor {fd}")));
+        }
+        if fl & libc::O_PATH != 0 || fl & libc::O_ACCMODE == libc::O_RDONLY {
+            bail!("descriptor {fd} is not open for writing");
+        }
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if copy < 0 {
+            return Err(os_err(&format!("copying descriptor {fd}")));
+        }
+        // Keep it out of helpers vssr runs (busctl). Not for 0-2, which the
+        // program inherits as its stdio.
+        if fd > 2 {
+            let fdfl = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if fdfl >= 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, fdfl | libc::FD_CLOEXEC) };
+            }
+        }
+        Ok(Audit { file: Mutex::new(Some(unsafe { File::from_raw_fd(copy) })), id, quiet })
+    }
+
+    /// One of vssr's messages: an event, and `text` on stderr unless quiet.
+    pub fn say(&self, event: &str, fields: Value, text: &str) {
+        self.event(event, fields);
+        if !self.quiet {
+            eprintln!("vssr: {text}");
+        }
     }
 
     pub fn event(&self, event: &str, fields: Value) {
@@ -147,6 +184,39 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn writes_to_a_passed_descriptor() {
+        let mut p = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (r, w) = unsafe { (File::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
+        let a = Audit::from_fd(w.as_raw_fd(), "t".into(), true).unwrap();
+        a.event("x", json!({"n": 1}));
+        drop(a);
+        // The caller's descriptor stays open; closing it ends the stream.
+        assert!(unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFD) } >= 0);
+        drop(w);
+        let text = std::io::read_to_string(r).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains(r#""event":"x""#) && text.contains(r#""sandbox":"t""#));
+    }
+
+    #[test]
+    fn refuses_descriptors_it_cannot_write() {
+        let mut p = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
+        let err = |fd| format!("{:#}", Audit::from_fd(fd, "t".into(), false).err().expect("refused"));
+        assert!(err(r.as_raw_fd()).contains("not open for writing"));
+        let c = CString::new("/").unwrap();
+        let opath = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(err(opath).contains("not open for writing"));
+        unsafe { libc::close(opath) };
+        // Above any descriptor limit, so never open (tests run in parallel
+        // threads, and a closed number could be reused meanwhile).
+        assert!(err(1 << 30).contains("Bad file descriptor"));
+        drop(w);
     }
 
     #[test]

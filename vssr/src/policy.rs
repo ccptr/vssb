@@ -64,6 +64,7 @@ deny = []              # extra syscalls to deny
 
 [audit]
 # log = "~/.local/state/vssr/audit.jsonl"
+quiet = false          # true: vssr's messages go only to the log, not to stderr
 "#;
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -295,7 +296,7 @@ pub struct SeccompCfg {
 #[serde(deny_unknown_fields, default)]
 pub struct AuditCfg {
     pub log: Option<String>,
-    /// Don't print blocked network requests to stderr.
+    /// vssr's own messages go only to the log, not to stderr.
     pub quiet: bool,
 }
 

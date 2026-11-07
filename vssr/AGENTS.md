@@ -47,6 +47,10 @@ into a `vssb::Sandbox` and `vssb::Command`.
   have planted (`resolve_guarded` on its directory, then `openat2` and
   `O_NOFOLLOW`), and only as a regular file. Missing directories on the
   way are made with `mkdirat` from the pinned parent, never by path.
+  `--audit-fd` takes a descriptor the caller passed in instead, so no path
+  is involved; vssr writes to a close-on-exec copy.
+- vssr's own messages go through `Audit::say` (an event, and stderr unless
+  quiet), never straight to stderr once the log is open.
 - The forwarded signals are blocked before the sandbox or any proxy
   thread starts, so only the signalfd receives them.
 - vssb's own invariants (fork safety of the child, mount-point lookup,

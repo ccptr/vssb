@@ -47,6 +47,30 @@ expect "  ...also reached through a missing directory and \"..\"" 125 -- run --a
 mkfifo audit.fifo
 timeout 10 "$V" run --audit-log audit.fifo -- true >/dev/null 2>&1; [ $? = 125 ] && ok "a FIFO as the audit log is refused, without hanging" || bad "a FIFO as the audit log is refused, without hanging"
 rm -f audit.jsonl logs audit.fifo
+# The event stream on a descriptor the caller holds: a pipe, which --audit-log
+# refuses (and /proc/self/fd/N is a symlink).
+ev=$("$V" run --audit-fd 3 -- true 3>&1 >/dev/null 2>&1)
+echo "$ev" | grep -q '"event":"start"' && echo "$ev" | grep -q '"event":"exit"' \
+    && ok "--audit-fd streams events to a pipe" || bad "--audit-fd streams events to a pipe" "$ev"
+"$V" run --audit-fd 7 -- sh -c '[ ! -e /proc/$$/fd/7 ]' 7>/dev/null; [ $? = 0 ] \
+    && ok "  ...which the sandbox doesn't inherit" || bad "  ...which the sandbox doesn't inherit"
+"$V" run --audit-fd 9 -- true 9</dev/null >/dev/null 2>&1; [ $? = 125 ] \
+    && ok "  ...and a read-only one is refused" || bad "  ...and a read-only one is refused"
+expect "  ...as is one that isn't open"  125 -- run --audit-fd 9 -- true
+# Quiet: vssr's messages go to the stream only, and stderr is the program's.
+quiet() { # NAME WANT_EXIT EVENT -- vssr run args...
+    local name=$1 want=$2 event=$3; shift 4
+    local err ev code
+    ev=$("$V" run -q --audit-fd 3 "$@" 3>&1 >/dev/null 2>"$WORK/quiet.err"); code=$?; err=$(cat "$WORK/quiet.err")
+    if [ $code = "$want" ] && ! echo "$err" | grep -q 'vssr:' && echo "$ev" | grep -q "\"event\":\"$event\""; then ok "$name"
+    else bad "$name" "exit $code, stderr: $(echo "$err" | tr '\n' ' ') events: $(echo "$ev" | grep -o '"event":"[a-z_]*"' | tr '\n' ' ')"; fi
+}
+quiet "--quiet keeps a timeout off stderr"       124 timeout -- --timeout 1s -- sleep 10
+quiet "  ...and a command that isn't found"      127 setup_failed -- -- /nonexistent/cmd
+expect "  ...and needs an audit log"             125 -- run -q -- true
+# A policy passed on a descriptor (a pipe), without a temporary file.
+out=$("$V" run -p /proc/self/fd/4 -- cat /proc/sys/kernel/hostname 4< <(printf '%s\n' '[fs]' 'rw = ["$PWD"]' '[sandbox]' 'hostname = "from-fd"') 2>&1)
+[ "$out" = from-fd ] && ok "a policy can come from a pipe (-p /proc/self/fd/N)" || bad "a policy can come from a pipe (-p /proc/self/fd/N)" "$out"
 ( cd ~ && "$V" run -- true >/dev/null 2>&1 ); [ $? = 125 ] && ok "refuses to run from \$HOME with the default policy" || bad "refuses to run from \$HOME with the default policy"
 expect_out "own PID namespace"         '^2$' -- run -- sh -c 'echo $$'
 expect_out "own hostname"              '^vssr$' -- run -- cat /proc/sys/kernel/hostname
@@ -269,6 +293,7 @@ ln -s "$WORK/outside" "$D/app/vendor"
 cd "$D/app" || exit 1
 expect "detected paths need detect.within"   1 -- run -- cat ../lib/marker
 expect_out "  ...and say how to allow them"  'outside detect.within' -- run -- true
+quiet "  ...as note events with --quiet"     0 note -- -- true
 W=(--detect-within "$D")
 expect "path dependencies are exposed"       0 -- run "${W[@]}" -- cat ../lib/marker
 expect "  ...transitively"                   0 -- run "${W[@]}" -- cat ../lib2/marker
@@ -389,6 +414,7 @@ if [ "${VSSR_TEST_OFFLINE:-}" != 1 ]; then
     expect_out "proxy blocks others"   '403' -- run --allow example.com -- curl -sS -m 15 -o /dev/null https://example.org
     expect_out "proxy blocks other ports" '403' -- run --allow example.com -- curl -sS -m 15 -o /dev/null https://example.com:8443
     expect_out "proxy blocks private addresses" 'blocked GET localhost:22' -- run --allow '*:*' -- curl -sS -m 5 -o /dev/null --noproxy '' -x http://127.0.0.1:3128 http://localhost:22/
+    quiet "  ...and --quiet keeps that off stderr" 0 net -- --allow '*:*' -- curl -sS -m 5 -o /dev/null --noproxy '' -x http://127.0.0.1:3128 http://localhost:22/
     expect_out "no bypassing the proxy" 'Could not connect|Couldn.t resolve|Failed to connect' -- run --allow example.com -- curl -sS -m 5 --noproxy '*' https://93.184.215.14
     "$V" run --allow example.com --audit-log "$WORK/audit.jsonl" -- curl -sS -m 15 -o /dev/null https://example.com >/dev/null 2>&1
     grep -q '"action":"allow".*"host":"example.com"' "$WORK/audit.jsonl" && grep -q '"event":"exit"' "$WORK/audit.jsonl" \

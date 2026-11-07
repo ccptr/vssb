@@ -107,6 +107,13 @@ struct RunArgs {
     /// Append JSON-lines audit events to this file
     #[arg(long, value_name = "FILE")]
     audit_log: Option<String>,
+    /// Write the audit events to this inherited descriptor (a pipe, socket
+    /// or file) instead of a log file
+    #[arg(long, value_name = "N", conflicts_with = "audit_log")]
+    audit_fd: Option<i32>,
+    /// Send vssr's own messages only to the audit log, not to stderr
+    #[arg(short, long)]
+    quiet: bool,
     /// Keep the controlling terminal (for interactive use)
     #[arg(long)]
     tty: bool,
@@ -220,6 +227,12 @@ fn resolve(args: &RunArgs) -> Result<Plan> {
     if args.audit_log.is_some() {
         p.audit.log = args.audit_log.clone();
     }
+    if args.audit_fd.is_some() {
+        p.audit.log = None;
+    }
+    if args.quiet {
+        p.audit.quiet = true;
+    }
     if args.tty {
         p.sandbox.tty = true;
     }
@@ -246,6 +259,9 @@ fn resolve(args: &RunArgs) -> Result<Plan> {
 
 fn run(args: RunArgs) -> Result<i32> {
     let plan = resolve(&args)?;
+    if plan.quiet && plan.audit_log.is_none() && args.audit_fd.is_none() {
+        bail!("quiet (--quiet, audit.quiet) sends vssr's messages to the audit log, and there is none (--audit-log, --audit-fd)");
+    }
     if args.dry_run {
         print!("{}", plan.describe());
         return Ok(0);
@@ -254,10 +270,19 @@ fn run(args: RunArgs) -> Result<i32> {
         bail!("no command given (vssr run [OPTIONS] -- COMMAND, or `command` in the policy)");
     }
     let id = std::env::var("VSSR_ID").unwrap_or_else(|_| util::random_id());
+    let audit = Arc::new(match args.audit_fd {
+        Some(fd) => Audit::from_fd(fd, id.clone(), plan.quiet).context("--audit-fd")?,
+        None => Audit::open(plan.audit_log.as_deref(), &plan.writable, id.clone(), plan.quiet)?,
+    });
     for n in &plan.notes {
-        eprintln!("vssr: {n}");
+        audit.say("note", json!({"text": n}), n);
     }
-    supervise(&plan, id)
+    // From here on, failures are events too (and stay off stderr if quiet).
+    supervise(&plan, &id, &audit).or_else(|e| {
+        let msg = format!("{e:#}");
+        audit.say("error", json!({"error": msg, "code": EXIT_SETUP}), &msg);
+        Ok(EXIT_SETUP)
+    })
 }
 
 fn sigset(sigs: &[libc::c_int]) -> libc::sigset_t {
@@ -273,8 +298,7 @@ fn sigset(sigs: &[libc::c_int]) -> libc::sigset_t {
 
 /// Starts the sandbox and stays with it until it exits: serves the proxy,
 /// forwards signals, enforces the timeout and writes the audit log.
-fn supervise(plan: &Plan, id: String) -> Result<i32> {
-    let audit = Arc::new(Audit::open(plan.audit_log.as_deref(), &plan.writable, id.clone(), !plan.quiet)?);
+fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>) -> Result<i32> {
 
     // Forwarded signals arrive on a signalfd. Block them before any thread
     // starts, so the proxy's threads inherit the mask and never take one.
@@ -287,13 +311,12 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
     let sfd = unsafe { OwnedFd::from_raw_fd(sfd) };
 
     let started = Instant::now();
-    let mut child = match plan.sandbox().spawn(plan.command(&id)) {
+    let mut child = match plan.sandbox().spawn(plan.command(id)) {
         Ok(c) => c,
         Err(e) => {
             let code = e.shell_code();
-            audit.event("setup_failed", json!({"command": plan.argv, "code": code, "error": e.to_string()}));
-            eprintln!("vssr: {e}");
-            if matches!(e, vssb::Error::Unsupported(_)) {
+            audit.say("setup_failed", json!({"command": plan.argv, "code": code, "error": e.to_string()}), &e.to_string());
+            if matches!(e, vssb::Error::Unsupported(_)) && !audit.quiet {
                 eprintln!("vssr: `vssr check` shows what this system supports; --no-strict runs with what is available");
             }
             return Ok(code);
@@ -302,7 +325,8 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
     let enforced = child.enforcement().clone();
     for (name, via) in [("memory", &enforced.memory), ("cpus", &enforced.cpus), ("pids", &enforced.pids)] {
         if *via == Some(Via::NotEnforced) {
-            eprintln!("vssr: warning: the {name} limit is not in effect (no cgroup, and no fallback took)");
+            let text = format!("the {name} limit is not in effect (no cgroup, and no fallback took)");
+            audit.say("warning", json!({"limit": name, "text": text}), &format!("warning: {text}"));
         }
     }
 
@@ -347,8 +371,7 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
         if !timed_out && let Some(d) = deadline && now >= d {
             timed_out = true;
             let t = plan.timeout.unwrap_or_default();
-            audit.event("timeout", json!({"after_s": t.as_secs()}));
-            eprintln!("vssr: timeout after {}s, stopping the sandbox", t.as_secs());
+            audit.say("timeout", json!({"after_s": t.as_secs()}), &format!("timeout after {}s, stopping the sandbox", t.as_secs()));
             let _ = child.signal(libc::SIGTERM);
             kill_at = now.checked_add(plan.kill_grace);
             continue;
@@ -361,7 +384,7 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
         ];
         unsafe { libc::poll(pfd.as_mut_ptr(), 2, ms) };
         if pfd[1].revents & libc::POLLIN != 0 {
-            forward_signals(plan, &sfd, &child, &audit);
+            forward_signals(plan, &sfd, &child, audit);
         }
     };
 
@@ -417,10 +440,11 @@ fn net_event(audit: &Audit, e: &Event) {
             audit.event("net", json!({"action": "allow", "method": method, "host": host, "port": port, "addr": addr.to_string()}));
         }
         Event::Deny { method, host, port, reason } => {
-            audit.event("net", json!({"action": "deny", "method": method, "host": host, "port": port, "reason": reason}));
-            if audit.notify {
-                eprintln!("vssr: blocked {method} {host}:{port} ({reason})");
-            }
+            audit.say(
+                "net",
+                json!({"action": "deny", "method": method, "host": host, "port": port, "reason": reason}),
+                &format!("blocked {method} {host}:{port} ({reason})"),
+            );
         }
         Event::Error { method, host, port, reason } => {
             audit.event("net", json!({"action": "error", "method": method, "host": host, "port": port, "reason": reason}));

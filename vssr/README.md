@@ -60,6 +60,8 @@ vssr run [OPTIONS] -- COMMAND [ARGS...]
   -e, --env NAME[=VAL]   pass or set an environment variable
       --cwd DIR          working directory inside
       --audit-log FILE   JSON-lines audit log
+      --audit-fd N       write the audit events to inherited descriptor N instead
+  -q, --quiet            vssr's own messages go only to the audit log, not stderr
       --tty              keep the terminal (interactive use)
       --detect-within DIR  expose detected build dependencies under DIR (read-only)
       --detect-within-rw DIR  the same, read-write
@@ -139,7 +141,7 @@ deny = ["kcmp", "nr:999"]
 
 [audit]
 log = "~/.local/state/vssr/audit.jsonl"
-quiet = false           # don't print blocked requests to stderr
+quiet = false           # vssr's messages (notes, warnings, blocked requests) only in the log
 ```
 
 **Paths.** `~`, `$VAR` and `${VAR}` are expanded; `$PWD` is the directory
@@ -201,6 +203,30 @@ or one of its directories there is a symlink, or the log isn't a regular
 file: a sandbox can't redirect the supervisor's writes elsewhere. The
 sandbox can still edit a log it can write to; keep it outside for a
 record the agent can't touch.
+
+**Driving vssr from another program.** `--audit-fd N` writes the events
+to a descriptor the caller passed in (a pipe, socket or file), with no
+path the sandbox could redirect; the sandbox doesn't inherit it. Events
+are one JSON object per line, each with `ts`, `sandbox` (`VSSR_ID` if
+set) and `event`:
+
+| Event | When |
+|---|---|
+| `note` | something detection left out, and why (`text`) |
+| `start` | the program has been exec'd: the ready event (`host_pid`, `limits`, …) |
+| `setup_failed` | the sandbox couldn't be set up or the program not run (`code`, `error`); no `start` follows |
+| `warning` | a limit isn't in effect (`limit`, `text`) |
+| `net`, `net_close` | each proxied connection: allowed, denied or failed, then its byte counts |
+| `signal` | a signal passed on to the program |
+| `timeout` | the timeout hit; SIGTERM, then SIGKILL after `kill_grace` |
+| `error` | vssr failed after the log was open (`error`); exit 125 |
+| `exit` | the run is over (`code`, `timed_out`, `duration_ms`) |
+
+With `--quiet`, vssr writes nothing to stderr once the log is open, so
+stderr carries only the program's own. Errors before that (a bad policy, a
+log that can't be opened) still go to stderr, with exit 125 and no event.
+A policy can come from a descriptor too: `-p /proc/self/fd/N` reads a
+pipe, so no temporary file is needed.
 
 ## Examples
 
