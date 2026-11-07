@@ -57,6 +57,6 @@ itself also get one in vssb's `tests/sandbox.rs`.
 before designing something new. `ergonomics.md`: project policies,
 profiles, permission requests, isolated runs, harness integration (the
 main note). `gui.md`: GUI applications (Wayland security contexts,
-filtered D-Bus, audio, GPU). `embedding.md`: audit of running vssr from
-another program (library vs. helper binary, gaps for game launchers);
-its library part became vssb.
+filtered D-Bus, audio, GPU). `embedding.md`: audit of embedding vssb
+(in process) or vssr (as a helper binary) in another program, and the
+gaps for game launchers.
