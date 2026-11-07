@@ -69,7 +69,8 @@ are the guarantees towards the host, each with an integration test in
 - **No leaked descriptors.** Init closes every descriptor except its own
   as its first step, so other threads' sockets and pipes don't stay open
   in it. The program gets stdio and the descriptors you pass
-  (`Command::pass_fd`), nothing else.
+  (`Command::pass_fd`), nothing else. If you have 0-2 closed, vssb keeps
+  its own descriptors off them, and `Stdio::Inherit` gives `/dev/null`.
 - **Explicit inputs.** Nothing is read from the host process: no
   environment (the program's environment starts empty), no current
   directory, no `$HOME`. Paths must be absolute.
@@ -79,15 +80,16 @@ are the guarantees towards the host, each with an integration test in
 - `Sandbox`: a reusable description.
   - `system(true)` adds the usual system view.
   - `mount(Mount::ro/rw/ro_at/rw_at/tmpfs/deny/symlink/proc/dev)`, with
-    `.noexec()`, `.optional()` and `.size()`. When two entries share a
-    destination, the later one wins.
+    `.noexec()`, `.optional()`, `.size()` and `.no_symlinks()` (refuse a
+    bind source with a symlink in its path instead of resolving it). When
+    two entries share a destination, the later one wins.
   - Network: `net(Net::None | Net::Host)`, `listen_tcp(port)`,
     `tcp_connect(ports)`, `tcp_bind(ports)`.
   - Syscalls: `seccomp_allow(name)`, `seccomp_deny(name)`.
   - Resources: `rlimit(Resource, n)`, `limits(Limits)`,
     `cgroup(Cgroup::Auto | Inherit | SystemdUserScope | Join(dir))`,
     `freeze_method(FreezeMethod::Auto | Cgroup | Signals)`. `Limits` has
-    `memory`, `cpus` and `pids`, with `cpu_method`, `cpu_choice` and
+    `memory`, `cpus` and `pids` (counting init, so at least 2), with `cpu_method`, `cpu_choice` and
     `pids_method` choosing how they're enforced (see "Limits without a
     cgroup").
   - Ids and the rest: `uid`, `gid`, `hostname`, `strict`.

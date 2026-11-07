@@ -148,6 +148,9 @@ beats `ro` beats `tmpfs`, and command-line entries beat the policy file.
 Nested entries work in any combination, e.g. a read-only `.git` inside a
 writable checkout, or a hidden `.env` inside it. A path that is a symlink
 on the host is recreated as a symlink (so `/bin -> usr/bin` keeps working).
+Symlinks inside a writable directory are never followed, whichever
+spelling of it (an alias, a symlinked `$HOME`) an entry uses: an earlier
+run may have planted them. Symlinks above it are fine.
 
 **Network patterns.** `host` allows ports 80 and 443; `host:port` and
 `host:*` widen that. `*.example.com` matches subdomains, not
@@ -191,6 +194,13 @@ lists to directories you'd be fine exposing that way, and `deny` secrets
 inside them. Symlinks under `within_rw` directories aren't followed for
 explicit entries either, since an earlier run may have planted them. Detected paths are canonicalised before the
 check, so symlinks in the project can't point outside `within`.
+
+**Audit log.** The log may sit in a writable directory (a relative path
+is taken from the current directory), so vssr refuses to start if the log
+or one of its directories there is a symlink, or the log isn't a regular
+file: a sandbox can't redirect the supervisor's writes elsewhere. The
+sandbox can still edit a log it can write to; keep it outside for a
+record the agent can't touch.
 
 ## Examples
 
@@ -240,13 +250,17 @@ Think about what you expose, not only what you block.
   read-only under it).
 - `--tty` keeps your terminal attached so interactive tools work.
   TIOCSTI is blocked, but the agent can still print escape sequences to
-  your terminal; prefer non-tty mode for unattended runs.
+  your terminal; prefer non-tty mode for unattended runs. Ctrl-C and
+  Ctrl-\ reach the program from the terminal itself; a SIGINT or SIGQUIT
+  sent to vssr by another process is passed on as without `--tty`.
 
 ## How it works
 
 `vssr run` (the supervisor) resolves the policy into a plan: it expands
 paths, runs the detectors, resolves symlinks and checks the writable
-directories, and merges everything into one mount list. It hands that
+directories, and merges everything into one mount list, with every bind
+source canonical (vssb then refuses a symlink in it, so one planted after
+the check fails the run instead of redirecting a bind). It hands that
 list, with the rest of the plan, to [vssb](../vssb), which does the
 sandboxing:
 

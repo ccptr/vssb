@@ -38,7 +38,14 @@ into a `vssb::Sandbox` and `vssb::Command`.
   content the sandboxed program may have edited.
 - Symlinks are resolved in `policy.rs`, before vssb sees a path: a host
   symlink exposed at its own place becomes a `Symlink` entry, and no
-  symlink is followed under a writable directory.
+  symlink is followed under a writable directory (`Plan::writable`).
+  Symlinks are judged by their canonical location (`util::resolve_guarded`),
+  never by how a path is spelt.
+- Bind sources reach vssb canonical and marked `no_symlinks`, so a symlink
+  planted after the check is an error, not a new destination.
+- The audit log is opened without following a symlink the sandbox could
+  have planted (`resolve_guarded` on its directory, then `openat2` and
+  `O_NOFOLLOW`), and only as a regular file.
 - The forwarded signals are blocked before the sandbox or any proxy
   thread starts, so only the signalfd receives them.
 - vssb's own invariants (fork safety of the child, mount-point lookup,

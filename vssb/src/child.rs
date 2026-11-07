@@ -352,9 +352,15 @@ fn run_program(p: &mut Prepared) -> (i32, Report) {
         }
     }
 
-    // Descriptors: move every source above all targets first, so no
-    // source is overwritten by another's target; then mark everything
+    // Descriptors: move the status pipe and every source above all
+    // targets first, so no target overwrites them; then mark everything
     // close-on-exec and dup each onto its target (dup3 clears the flag).
+    let w = unsafe { libc::fcntl(p.status_w, libc::F_DUPFD_CLOEXEC, p.fd_base) };
+    if w < 0 {
+        return fail(report::FDS, errno());
+    }
+    close(p.status_w);
+    p.status_w = w;
     for (&(src, _), tmp) in p.fd_map.iter().zip(p.fd_tmp.iter_mut()) {
         *tmp = unsafe { libc::fcntl(src, libc::F_DUPFD_CLOEXEC, p.fd_base) };
         if *tmp < 0 {

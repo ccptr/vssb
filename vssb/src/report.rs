@@ -39,6 +39,7 @@ pub(crate) const SECCOMP: u32 = 30;
 pub(crate) const EXEC: u32 = 31;
 pub(crate) const PID_MAX: u32 = 32;
 pub(crate) const PIN: u32 = 33;
+pub(crate) const SOURCE_SYMLINK: u32 = 34;
 
 /// `a` when a step isn't about one mount.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -109,21 +110,18 @@ pub(crate) fn to_error(r: Report, cx: &Context) -> Error {
         CGROUP_NS => "creating the cgroup namespace".into(),
         MOUNT_PRIVATE => "making mounts private".into(),
         OPEN_SOURCE => format!("cloning the mount source of {shown}"),
+        SOURCE_SYMLINK => format!("the source of {shown} has a symlink in its path (it changed after it was resolved, or the mount refuses symlinks)"),
         SET_ATTR => format!("setting mount flags for {shown}"),
         NEW_FS if r.a == NONE => "creating an internal filesystem".into(),
         NEW_FS => format!("creating the filesystem for {shown}"),
         NEW_ROOT => "creating the new root".into(),
         OPEN_PATH => format!("looking up {}", prefix(&d, r.b).display()),
         NOT_CREATABLE => {
-            let owner = dest(r.c);
-            return Error::Setup {
-                step: format!(
-                    "cannot mount on {shown}: {} does not exist inside {} (a host directory), and vssb won't create it there",
-                    prefix(&d, r.b).display(),
-                    owner.display()
-                ),
-                source: os,
-            };
+            // `b` components of the destination: all of them when the
+            // missing entry is the mount point or symlink itself.
+            let missing = prefix(&d, r.b);
+            let what = if missing == d { String::new() } else { format!("setting up {shown}: ") };
+            format!("{what}{} does not exist inside {} (a host directory), and vssb won't create it there", missing.display(), dest(r.c).display())
         }
         SYMLINK_IN_PATH => format!("{} is a symlink; mount paths can't pass through symlinks (use the real path)", prefix(&d, r.b).display()),
         NOT_DIR => format!("{} is not a directory", prefix(&d, r.b).display()),

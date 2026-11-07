@@ -214,7 +214,11 @@ pub(crate) fn resolve_mounts(sb: &Sandbox) -> Result<Vec<Mount>> {
             if !src.is_absolute() {
                 return Err(Error::Config(format!("mount source {} must be absolute", src.display())));
             }
-            match std::fs::canonicalize(&*src) {
+            // With no_symlinks the path is taken as it is; the child refuses
+            // a symlink in it. Otherwise resolve it now: the child refuses
+            // a symlink that appears after this.
+            let found = if m.no_symlinks { std::fs::symlink_metadata(&*src).map(|_| normalize(src)) } else { std::fs::canonicalize(&*src) };
+            match found {
                 Ok(c) => *src = c,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && m.optional => continue,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -239,17 +243,32 @@ fn tmpfs_opts(mode: &str, size: Option<u64>) -> Result<Vec<(CString, CString)>> 
     Ok(o)
 }
 
+/// Moves a descriptor of ours off 0-2. When the caller has one of those
+/// closed, the next descriptor opened takes its place, and the child would
+/// take it for the caller's stdin, stdout or stderr.
+pub(crate) fn above_stdio(fd: OwnedFd) -> Result<OwnedFd> {
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    let n = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if n < 0 {
+        return Err(Error::io("fcntl(F_DUPFD_CLOEXEC)", io::Error::last_os_error()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(n) })
+}
+
 fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut p = [0; 2];
     if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         return Err(Error::io("pipe", io::Error::last_os_error()));
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) })
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
+    Ok((above_stdio(r)?, above_stdio(w)?))
 }
 
 fn open_null() -> Result<OwnedFd> {
     let f = File::options().read(true).write(true).open("/dev/null").map_err(|e| Error::io("/dev/null", e))?;
-    Ok(f.into())
+    above_stdio(f.into())
 }
 
 fn random_id() -> String {
@@ -290,8 +309,8 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
     {
         return Err(Error::Config("cpus must be positive".into()));
     }
-    if sb.limits.pids == Some(0) {
-        return Err(Error::Config("pids must be at least 1".into()));
+    if sb.limits.pids.is_some_and(|n| n < 2) {
+        return Err(Error::Config("pids must be at least 2 (it counts init as well as the program)".into()));
     }
 
     // Landlock.
@@ -332,7 +351,7 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
     // of pids + 299 leaves exactly pids - 1 numbers for the program's
     // tasks once init has made them wrap, as pids.max would with init.
     let pid_max = match l.pids {
-        Some(n) if l.pids_method != PidsMethod::Cgroup => Some((n.saturating_add(299)).max(301)),
+        Some(n) if l.pids_method != PidsMethod::Cgroup => Some(n.saturating_add(299)),
         _ => None,
     };
 
@@ -407,7 +426,7 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) } < 0 {
         return Err(Error::io("socketpair", io::Error::last_os_error()));
     }
-    let (ctl, ctl_child) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+    let (ctl, ctl_child) = unsafe { (above_stdio(OwnedFd::from_raw_fd(sv[0]))?, above_stdio(OwnedFd::from_raw_fd(sv[1]))?) };
     let (status, status_w) = pipe()?;
     let (ctl_raw, status_raw) = (ctl_child.as_raw_fd(), status_w.as_raw_fd());
     let mut child_side = vec![ctl_child, status_w];
@@ -438,9 +457,19 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
         };
         fd_map.push((src, target));
     }
+    // Targets and the copies above them (fd_base and up) must fit under
+    // the descriptor limit.
+    let fd_limit = {
+        let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
+        r.rlim_cur.min(i32::MAX as u64) as i32
+    };
     for (target, f) in cmd.fds {
         if target < 3 {
             return Err(Error::Config(format!("pass_fd target {target}: use stdin/stdout/stderr for 0-2")));
+        }
+        if target >= fd_limit {
+            return Err(Error::Config(format!("pass_fd target {target}: not below the descriptor limit ({fd_limit})")));
         }
         fd_map.push((f.as_raw_fd(), target));
         child_side.push(f);
@@ -449,6 +478,10 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
     keep_fds.sort_unstable();
     keep_fds.dedup();
     let fd_base = fd_map.iter().map(|&(_, t)| t).max().unwrap_or(2).max(2) + 1;
+    // The program's process copies every source, and the status pipe, to fd_base and up.
+    if fd_base as i64 + fd_map.len() as i64 + 1 > fd_limit as i64 {
+        return Err(Error::Config(format!("pass_fd targets up to {}: no room above them under the descriptor limit ({fd_limit})", fd_base - 1)));
+    }
     let fd_tmp = vec![-1; fd_map.len()];
     let [stdin, stdout, stderr] = ends;
 
@@ -491,7 +524,7 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
                 .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
                 .open(path)
                 .map_err(|e| Error::io(format!("opening cgroup {}", path.display()), e))?;
-            CgroupPlan::Join { fd: f.into(), path: path.clone() }
+            CgroupPlan::Join { fd: above_stdio(f.into())?, path: path.clone() }
         }
     };
 

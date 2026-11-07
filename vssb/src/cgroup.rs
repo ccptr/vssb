@@ -5,9 +5,16 @@
 //! The child then makes that scope the root of its cgroup namespace.
 
 use crate::config::Limits;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// cpu.max for `cpus` CPUs: (quota, period) in microseconds.
+fn cpu_quota(cpus: f64) -> (u64, u64) {
+    let period = 100_000u64;
+    (((cpus * period as f64).round() as u64).max(1000), period)
+}
 
 /// Writes limits into a cgroup directory the caller prepared. Whether
 /// they took is checked afterwards with [`in_effect`].
@@ -18,8 +25,7 @@ pub(crate) fn write_limits(dir: &Path, l: &Limits) {
         let _ = std::fs::write(dir.join("memory.swap.max"), "0");
     }
     if let Some(c) = l.cpus {
-        let period = 100_000u64;
-        let quota = ((c * period as f64).round() as u64).max(1000);
+        let (quota, period) = cpu_quota(c);
         let _ = std::fs::write(dir.join("cpu.max"), format!("{quota} {period}"));
     }
     if let Some(p) = l.pids {
@@ -35,13 +41,30 @@ pub(crate) struct InEffect {
     pub pids: bool,
 }
 
+/// A limit counts as in effect when the cgroup's value is at most the
+/// requested one (a write that failed may have left a larger one).
 pub(crate) fn in_effect(dir: &Path, l: &Limits) -> InEffect {
-    let read = |f: &str| std::fs::read_to_string(dir.join(f)).map(|s| s.trim().to_string()).unwrap_or_default();
-    let set = |f: &str| !matches!(read(f).as_str(), "" | "max");
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).map(|s| s.trim().to_string());
+    let num = |f: &str| read(f).ok().and_then(|s| s.parse::<u64>().ok());
+    // Without swap accounting there is no memory.swap.max, and no swap to limit.
+    let no_swap = || match read("memory.swap.max") {
+        Ok(s) => s == "0",
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+    };
+    let cpus = |c: f64| {
+        let (quota, period) = cpu_quota(c);
+        let s = read("cpu.max").unwrap_or_default();
+        let mut it = s.split_whitespace().map(|v| v.parse::<u64>().ok());
+        match (it.next().flatten(), it.next().flatten()) {
+            // quota'/period' <= quota/period
+            (Some(q), Some(p)) if p > 0 => q as u128 * period as u128 <= quota as u128 * p as u128,
+            _ => false,
+        }
+    };
     InEffect {
-        memory: l.memory.is_some() && set("memory.max"),
-        cpus: l.cpus.is_some() && !read("cpu.max").starts_with("max") && !read("cpu.max").is_empty(),
-        pids: l.pids.is_some() && set("pids.max"),
+        memory: l.memory.is_some_and(|m| num("memory.max").is_some_and(|v| v <= m) && no_swap()),
+        cpus: l.cpus.is_some_and(cpus),
+        pids: l.pids.is_some_and(|n| num("pids.max").is_some_and(|v| v <= n)),
     }
 }
 
@@ -106,4 +129,75 @@ pub(crate) fn enter_scope(pid: i32, unit: &str, l: &Limits) -> Result<PathBuf, S
         std::thread::sleep(Duration::from_millis(2));
     };
     Ok(Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Controller files in a temporary directory.
+    fn check(files: &[(&str, &str)], l: &Limits) -> InEffect {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("vssb-cgroup-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (f, v) in files {
+            std::fs::write(dir.join(f), format!("{v}\n")).unwrap();
+        }
+        let r = in_effect(&dir, l);
+        std::fs::remove_dir_all(&dir).unwrap();
+        r
+    }
+
+    fn all() -> Limits {
+        Limits { memory: Some(64 << 20), cpus: Some(1.0), pids: Some(4), ..Default::default() }
+    }
+
+    #[test]
+    fn values_at_most_the_request_are_in_effect() {
+        let r = check(&[("memory.max", "67108864"), ("memory.swap.max", "0"), ("cpu.max", "100000 100000"), ("pids.max", "4")], &all());
+        assert!(r.memory && r.cpus && r.pids, "{r:?}");
+        // Smaller ones too (a tighter limit someone else set); same ratio, other period.
+        let r = check(&[("memory.max", "4096"), ("cpu.max", "25000 50000"), ("pids.max", "2")], &all());
+        assert!(r.memory && r.cpus && r.pids, "no memory.swap.max: no swap accounting; {r:?}");
+        let r = check(&[("cpu.max", "50000 50000")], &Limits { cpus: Some(1.0), ..Default::default() });
+        assert!(r.cpus);
+    }
+
+    #[test]
+    fn larger_or_missing_values_are_not() {
+        // What a failed write leaves behind.
+        let r = check(&[("memory.max", "1073741824"), ("memory.swap.max", "0"), ("cpu.max", "800000 100000"), ("pids.max", "4096")], &all());
+        assert!(!r.memory && !r.cpus && !r.pids, "{r:?}");
+        let r = check(&[("memory.max", "max"), ("cpu.max", "max 100000"), ("pids.max", "max")], &all());
+        assert!(!r.memory && !r.cpus && !r.pids, "{r:?}");
+        let r = check(&[], &all());
+        assert!(!r.memory && !r.cpus && !r.pids, "{r:?}");
+        // Just above the quota.
+        let r = check(&[("cpu.max", "100001 100000")], &all());
+        assert!(!r.cpus);
+        // Swap left on.
+        let r = check(&[("memory.max", "67108864"), ("memory.swap.max", "max")], &all());
+        assert!(!r.memory);
+        let r = check(&[("memory.max", "67108864"), ("memory.swap.max", "1048576")], &all());
+        assert!(!r.memory);
+    }
+
+    #[test]
+    fn unrequested_limits_are_not_in_effect() {
+        let r = check(&[("memory.max", "1"), ("cpu.max", "1000 100000"), ("pids.max", "1")], &Limits::default());
+        assert!(!r.memory && !r.cpus && !r.pids, "{r:?}");
+    }
+
+    #[test]
+    fn written_limits_and_systemds_are_in_effect() {
+        for c in [0.001, 0.3, 1.0, 1.2345549, 7.5] {
+            let (q, p) = cpu_quota(c);
+            let l = Limits { cpus: Some(c), ..Default::default() };
+            assert!(check(&[("cpu.max", &format!("{q} {p}"))], &l).cpus, "{c}");
+            // What systemd writes for enter_scope's CPUQuotaPerSecUSec.
+            let usec = ((c * 1e6).round() as u64).max(10_000);
+            assert!(check(&[("cpu.max", &format!("{} 100000", (usec * 100_000 / 1_000_000).max(1000)))], &l).cpus, "{c}");
+        }
+    }
 }

@@ -1,13 +1,15 @@
 //! Builds the filesystem view inside the new mount namespace. Runs in the
 //! cloned child: raw syscalls only, no allocation (see child.rs).
 //!
-//! Bind sources are cloned (open_tree) and given their final flags
-//! (read-only, nosuid, nodev, noexec) while still detached, so they never
-//! appear writable. A fresh tmpfs becomes the new root, mounts are attached
-//! under it parent-first, and mount points are looked up with
+//! Bind sources are opened with openat2(RESOLVE_NO_SYMLINKS), so a symlink
+//! planted after the parent resolved them can't redirect a bind, then
+//! cloned (open_tree) and given their final flags (read-only, nosuid,
+//! nodev, noexec) while still detached, so they never appear writable. A
+//! fresh tmpfs becomes the new root, mounts are attached under it
+//! parent-first, and mount points are looked up with
 //! openat2(RESOLVE_NO_SYMLINKS) so no symlink can redirect a mount. Mount
-//! points are only ever created in filesystems vssb made itself, never
-//! inside a bind mount (that would write to the host).
+//! points and symlinks are only ever created in filesystems vssb made
+//! itself, never inside a bind mount (that would write to the host).
 
 use crate::prepare::{POp, PMount, Prepared};
 use crate::report::{self, Report};
@@ -77,12 +79,32 @@ fn pairs(v: &[(std::ffi::CString, std::ffi::CString)]) -> impl Iterator<Item = (
     v.iter().map(|(k, v)| (k.as_c_str(), v.as_c_str()))
 }
 
-/// Opens one path component under `dir` without following any symlink.
-fn open_component(dir: i32, name: &CStr) -> Result<i32, i32> {
+fn open_nofollow(dir: i32, path: &CStr, resolve: u64) -> Result<i32, i32> {
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-    how.resolve = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH;
-    chk_fd(unsafe { libc::syscall(libc::SYS_openat2, dir, name.as_ptr(), &how as *const libc::open_how, std::mem::size_of::<libc::open_how>()) })
+    how.resolve = resolve;
+    chk_fd(unsafe { libc::syscall(libc::SYS_openat2, dir, path.as_ptr(), &how as *const libc::open_how, std::mem::size_of::<libc::open_how>()) })
+}
+
+/// Opens one path component under `dir` without following any symlink.
+fn open_component(dir: i32, name: &CStr) -> Result<i32, i32> {
+    open_nofollow(dir, name, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH)
+}
+
+/// Clones a bind source's mount tree. The path is canonical (or the mount
+/// refuses symlinks), so any symlink in it is refused: ELOOP.
+fn clone_source(src: &CStr) -> Result<i32, i32> {
+    let fd = open_nofollow(libc::AT_FDCWD, src, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)?;
+    // O_PATH|O_NOFOLLOW opens a final symlink instead of failing.
+    let r = match file_type(fd) {
+        Ok(libc::S_IFLNK) => Err(libc::ELOOP),
+        Ok(_) => chk_fd(unsafe {
+            libc::syscall(libc::SYS_open_tree, fd, c"".as_ptr(), OPEN_TREE_CLONE | libc::O_CLOEXEC as u32 | AT_RECURSIVE | libc::AT_EMPTY_PATH as u32)
+        }),
+        Err(e) => Err(e),
+    };
+    close(fd);
+    r
 }
 
 fn file_type(fd: i32) -> Result<u32, i32> {
@@ -193,7 +215,7 @@ pub(crate) fn build(p: &mut Prepared) -> R<()> {
     for (i, m) in p.mounts.iter().enumerate() {
         let ix = i as u32;
         let fd = match &m.op {
-            POp::Bind { src, rw } => match open_tree(libc::AT_FDCWD, src, true) {
+            POp::Bind { src, rw } => match clone_source(src) {
                 Ok(fd) => {
                     let mut a = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
                     if !rw {
@@ -206,6 +228,7 @@ pub(crate) fn build(p: &mut Prepared) -> R<()> {
                     fd
                 }
                 Err(libc::ENOENT) if m.optional => -1,
+                Err(libc::ELOOP) => return Err(Report::new(report::SOURCE_SYMLINK, libc::ELOOP, ix)),
                 Err(e) => return Err(Report::new(report::OPEN_SOURCE, e, ix)),
             },
             POp::Proc => new_fs(c"proc", std::iter::empty(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)
@@ -257,6 +280,15 @@ pub(crate) fn build(p: &mut Prepared) -> R<()> {
         match &m.op {
             POp::Symlink { target } => {
                 let Some(dir) = ensure(root, mounts, regions, i, depth - 1, Kind::Dir, true, m.optional)? else { continue };
+                // Like a mount point, never created inside a host directory.
+                let (creatable, region) = owner(mounts, regions, i, depth - 1);
+                if !creatable {
+                    close(dir);
+                    if m.optional {
+                        continue;
+                    }
+                    return Err(Report::with(report::NOT_CREATABLE, libc::ENOENT, ix, depth as u32, region));
+                }
                 let name = m.comps.last().map(|c| c.as_c_str()).unwrap_or(c"");
                 let r = unsafe { libc::symlinkat(target.as_ptr(), dir, name.as_ptr()) };
                 close(dir);

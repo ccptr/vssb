@@ -28,6 +28,9 @@ const EXIT_TIMEOUT: i32 = 124;
 
 /// Signals vssr passes on to the sandboxed program.
 const FORWARDED: [libc::c_int; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGUSR1, libc::SIGUSR2];
+/// `ssi_code` of a signal sent by the kernel (the terminal's, for SIGINT
+/// and SIGQUIT), not by another process.
+const SI_KERNEL: i32 = 0x80;
 
 #[derive(Parser)]
 #[command(name = "vssr", version, about = "Run commands in a Linux sandbox with fine-grained permissions")]
@@ -271,7 +274,7 @@ fn sigset(sigs: &[libc::c_int]) -> libc::sigset_t {
 /// Starts the sandbox and stays with it until it exits: serves the proxy,
 /// forwards signals, enforces the timeout and writes the audit log.
 fn supervise(plan: &Plan, id: String) -> Result<i32> {
-    let audit = Arc::new(Audit::open(plan.audit_log.as_deref(), id.clone(), !plan.quiet)?);
+    let audit = Arc::new(Audit::open(plan.audit_log.as_deref(), &plan.writable, id.clone(), !plan.quiet)?);
 
     // Forwarded signals arrive on a signalfd. Block them before any thread
     // starts, so the proxy's threads inherit the mask and never take one.
@@ -326,7 +329,8 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
         }),
     );
 
-    let deadline = plan.timeout.map(|t| started + t);
+    // Too far off to represent: no deadline.
+    let deadline = plan.timeout.and_then(|t| started.checked_add(t));
     let mut timed_out = false;
     let mut kill_at: Option<Instant> = None;
     let status = loop {
@@ -346,7 +350,7 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
             audit.event("timeout", json!({"after_s": t.as_secs()}));
             eprintln!("vssr: timeout after {}s, stopping the sandbox", t.as_secs());
             let _ = child.signal(libc::SIGTERM);
-            kill_at = Some(now + plan.kill_grace);
+            kill_at = now.checked_add(plan.kill_grace);
             continue;
         }
         let next = if timed_out { kill_at } else { deadline };
@@ -376,12 +380,18 @@ fn forward_signals(plan: &Plan, sfd: &OwnedFd, child: &vssb::Child, audit: &Audi
             return;
         }
         let sig = info.ssi_signo as i32;
-        if plan.tty && (sig == libc::SIGINT || sig == libc::SIGQUIT) {
-            continue; // the program got it from the terminal already
+        if !should_forward(plan.tty, sig, info.ssi_code) {
+            continue;
         }
         audit.event("signal", json!({"signal": sig}));
         let _ = child.signal(sig);
     }
+}
+
+/// With the terminal kept, the program gets the terminal's SIGINT and
+/// SIGQUIT itself; don't double those. Ones another process sent go on.
+fn should_forward(tty: bool, sig: i32, code: i32) -> bool {
+    !(tty && code == SI_KERNEL && matches!(sig, libc::SIGINT | libc::SIGQUIT))
 }
 
 /// How each limit that was set is enforced, for the start event.
@@ -419,5 +429,22 @@ fn net_event(audit: &Audit, e: &Event) {
             let ms = duration.as_millis() as u64;
             audit.event("net_close", json!({"host": host, "port": port, "bytes_up": bytes_up, "bytes_down": bytes_down, "ms": ms}));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_signals_are_not_doubled() {
+        const SI_USER: i32 = 0;
+        assert!(!should_forward(true, libc::SIGINT, SI_KERNEL));
+        assert!(!should_forward(true, libc::SIGQUIT, SI_KERNEL));
+        // Sent by another process (kill), or without the terminal: forwarded.
+        assert!(should_forward(true, libc::SIGINT, SI_USER));
+        assert!(should_forward(true, libc::SIGQUIT, libc::SI_QUEUE));
+        assert!(should_forward(true, libc::SIGTERM, SI_KERNEL));
+        assert!(should_forward(false, libc::SIGINT, SI_KERNEL));
     }
 }

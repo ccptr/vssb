@@ -36,6 +36,15 @@ expect "command not found is 127"      127 -- run -- /nonexistent/cmd
 "$V" run --audit-log "$WORK/setup.jsonl" -- /nonexistent/cmd >/dev/null 2>&1
 grep '"event":"setup_failed"' "$WORK/setup.jsonl" | grep -q '"code":127' && ! grep -q '"event":"start"' "$WORK/setup.jsonl" \
     && ok "setup failures are audited, not started" || bad "setup failures are audited, not started" "$(cat "$WORK/setup.jsonl" 2>/dev/null)"
+echo keep > "$WORK/audit-sentinel"; ln -s "$WORK/audit-sentinel" audit.jsonl
+expect "a symlinked audit log is refused" 125 -- run --audit-log audit.jsonl -- true
+[ "$(cat "$WORK/audit-sentinel")" = keep ] && ok "  ...and its target is untouched" || bad "  ...and its target is untouched"
+mkdir -p "$WORK/audit-dir"; ln -s "$WORK/audit-dir" logs
+expect "  ...and so is a symlinked directory in a writable one" 125 -- run --audit-log logs/a.jsonl -- true
+[ -z "$(ls -A "$WORK/audit-dir")" ] && ok "  ...which stays empty" || bad "  ...which stays empty"
+mkfifo audit.fifo
+timeout 10 "$V" run --audit-log audit.fifo -- true >/dev/null 2>&1; [ $? = 125 ] && ok "a FIFO as the audit log is refused, without hanging" || bad "a FIFO as the audit log is refused, without hanging"
+rm -f audit.jsonl logs audit.fifo
 ( cd ~ && "$V" run -- true >/dev/null 2>&1 ); [ $? = 125 ] && ok "refuses to run from \$HOME with the default policy" || bad "refuses to run from \$HOME with the default policy"
 expect_out "own PID namespace"         '^2$' -- run -- sh -c 'echo $$'
 expect_out "own hostname"              '^vssr$' -- run -- cat /proc/sys/kernel/hostname
@@ -69,6 +78,13 @@ ln -sf ~/.ssh sneaky
 expect "won't follow symlinks in writable dirs" 125 -- run --ro "$PWD/sneaky" -- true
 ln -sf /usr/bin/true data/sym 2>/dev/null
 expect "won't mount through symlinks"  125 -- run --tmpfs "$PWD/sneaky/x" -- true
+# Two spellings of one writable directory (alias -> real), and a symlink an
+# earlier run could have planted in it.
+mkdir -p "$WORK/real/work/sub" "$WORK/planted-target" && ln -s real "$WORK/alias"
+ln -s "$WORK/planted-target" "$WORK/real/work/planted"; echo s > "$WORK/real/work/sub/f"
+expect "no symlinks in a writable dir named through an alias" 125 -- run --rw "$WORK/alias/work:/work" --ro "$WORK/real/work/planted:/exposed" -- true
+expect "  ...nor the reverse"          125 -- run --rw "$WORK/real/work:/work" --ro "$WORK/alias/work/planted:/exposed" -- true
+expect "symlinks above a writable dir are followed" 0 -- run --rw "$WORK/alias/work" --ro "$WORK/alias/work/sub" -- cat "$WORK/alias/work/sub/f"
 expect "ro .git inside a writable checkout" 1 -- run --ro "$PWD/.git" -- sh -c 'echo x > .git/config'
 expect "  ...while the rest stays writable" 0 -- run --ro "$PWD/.git" -- sh -c 'echo x > ok.txt'
 # A host socket exposed read-only outside any writable path (think docker.sock).
@@ -220,6 +236,14 @@ sup=$!
 sleep 0.5
 kill -TERM "$sup"; wait "$sup"; code=$?
 grep -q got-term sig.out && [ $code = 3 ] && ok "SIGTERM is forwarded to the agent" || bad "SIGTERM is forwarded to the agent" "exit $code: $(cat sig.out)"
+# Background jobs of a script start with SIGINT ignored; undo that.
+env --default-signal=INT "$V" run --tty -- sh -c 'trap "echo got-int; exit 3" INT; sleep 5 & wait' > sig.out 2>&1 &
+sup=$!
+sleep 1
+kill -INT "$sup"; wait "$sup"; code=$?
+grep -q got-int sig.out && [ $code = 3 ] && ok "with --tty, a SIGINT from kill is still forwarded" || bad "with --tty, a SIGINT from kill is still forwarded" "exit $code: $(cat sig.out)"
+expect "an unrepresentable timeout is a config error" 125 -- run --timeout 1e300 --dry-run -- true
+expect "a timeout beyond the clock's range runs" 0 -- run --timeout 1e19 -- true
 
 echo "== network"
 expect_out "no network by default"     'Could not resolve|Failed to connect' -- run -- curl -sS -m 5 -o /dev/null https://example.com

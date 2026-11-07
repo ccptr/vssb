@@ -1,7 +1,7 @@
 //! Policy files (TOML) and their resolution into a concrete [`Plan`],
 //! which maps onto a vssb [`Sandbox`] and [`Command`].
 
-use crate::util::{expand, expand_path, parse_duration, parse_size};
+use crate::util::{expand, expand_path, parse_duration, parse_size, resolve_guarded};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -360,6 +360,9 @@ pub struct Plan {
     pub seccomp_deny: Vec<String>,
     pub audit_log: Option<PathBuf>,
     pub quiet: bool,
+    /// Host directories the sandbox can write now or may have written in
+    /// an earlier run, canonical. No symlink under them is followed.
+    pub writable: Vec<PathBuf>,
     /// Why each detected mount is there, by inside path.
     pub detected: BTreeMap<PathBuf, String>,
     /// Messages for the user from plan resolution (detection results).
@@ -398,21 +401,24 @@ impl Plan {
             }
         }
 
-        // Writable host directories: sources under them may have been
-        // tampered with by an earlier sandbox run, so no symlinks are followed there.
-        // Directories under detect.within_rw may have been written by an
-        // earlier run, whether or not this one exposes them.
-        let mut rw_roots: Vec<PathBuf> = policy.detect.roots(cwd)?.into_iter().filter(|r| r.1).map(|r| r.0).collect();
+        // Writable host directories, canonical: sources under them may have
+        // been tampered with by an earlier sandbox run, so no symlinks are
+        // followed there. Directories under detect.within_rw may have been
+        // written by an earlier run, whether or not this one exposes them.
+        let mut writable: Vec<PathBuf> = policy.detect.roots(cwd)?.into_iter().filter(|r| r.1).map(|r| r.0).collect();
         let project = project_root(cwd, &std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone()));
         if policy.detect.project == ProjectMode::Rw
             && let Some(p) = &project
+            && let Ok(c) = std::fs::canonicalize(p)
         {
-            rw_roots.push(p.clone());
+            writable.push(c);
         }
         for (kind, spec) in &entries {
             if *kind == FsKind::Rw {
                 let (_, src, _) = split_spec(spec, cwd)?;
-                rw_roots.push(src);
+                if let Ok(c) = std::fs::canonicalize(&src) {
+                    writable.push(c);
+                }
             }
         }
 
@@ -420,7 +426,7 @@ impl Plan {
         for (kind, spec) in &entries {
             let (optional, src, dest) = split_spec(spec, cwd)?;
             let m = match kind {
-                FsKind::Tmpfs => Mount { dest, kind: MountKind::Tmpfs { size: None }, noexec: false, optional },
+                FsKind::Tmpfs => Mount { dest, kind: MountKind::Tmpfs { size: None }, noexec: false, optional, no_symlinks: false },
                 FsKind::Deny => {
                     if src != dest {
                         bail!("{spec:?}: deny entries take a single path");
@@ -428,13 +434,13 @@ impl Plan {
                     Mount::deny(dest)
                 }
                 FsKind::Ro | FsKind::Rw => {
-                    match resolve_source(&src, &dest, &rw_roots)? {
+                    match resolve_source(&src, &dest, &writable)? {
                         Some(k) => {
                             let k = match k {
                                 MountKind::Bind { src, .. } => MountKind::Bind { src, writable: *kind == FsKind::Rw },
                                 other => other,
                             };
-                            Mount { dest, kind: k, noexec: false, optional }
+                            Mount { dest, kind: k, noexec: false, optional, no_symlinks: false }
                         }
                         None if optional => continue,
                         None => bail!("{}: no such file or directory (prefix the entry with '?' to make it optional)", src.display()),
@@ -547,16 +553,21 @@ impl Plan {
             // A host path, so '..' is fine here.
             audit_log: policy.audit.log.as_deref().map(|l| expand(l, cwd).map(|e| cwd.join(e))).transpose()?,
             quiet: policy.audit.quiet,
+            writable,
             detected,
             notes,
         })
     }
 
     /// The sandbox this plan describes. The view is complete already, so
-    /// vssb's own system view stays off.
+    /// vssb's own system view stays off. Bind sources are canonical and
+    /// checked, so vssb refuses any symlink in them (one planted since).
     pub fn sandbox(&self) -> Sandbox {
         let mut sb = Sandbox::new();
-        sb.mounts(self.mounts.iter().cloned())
+        sb.mounts(self.mounts.iter().map(|m| match m.kind {
+            MountKind::Bind { .. } => m.clone().no_symlinks(),
+            _ => m.clone(),
+        }))
             .hostname(self.hostname.clone())
             .uid(self.uid)
             .gid(self.gid)
@@ -734,7 +745,7 @@ fn add_detected(
             continue;
         };
         let kind = MountKind::Bind { src: f.path.clone(), writable: rw };
-        mounts.insert(f.path.clone(), Mount { dest: f.path.clone(), kind, noexec: false, optional: true });
+        mounts.insert(f.path.clone(), Mount { dest: f.path.clone(), kind, noexec: false, optional: true, no_symlinks: false });
         added.insert(f.path, f.why);
     }
     Ok((added, notes))
@@ -757,35 +768,28 @@ fn split_spec(spec: &str, cwd: &Path) -> Result<(bool, PathBuf, PathBuf)> {
 }
 
 /// Works out how to expose a host path: as a symlink (when the host path is
-/// a symlink exposed at the same place) or as a bind of its canonical path.
-fn resolve_source(src: &Path, dest: &Path, rw_roots: &[PathBuf]) -> Result<Option<MountKind>> {
+/// a symlink exposed at the same place, outside the writable directories)
+/// or as a bind of its canonical path. Each symlink on the way is judged by
+/// where it really lives, whatever the spelling: one under a writable
+/// directory is refused.
+fn resolve_source(src: &Path, dest: &Path, writable: &[PathBuf]) -> Result<Option<MountKind>> {
     let meta = match std::fs::symlink_metadata(src) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("{}", src.display())),
     };
-    if meta.file_type().is_symlink() && src == dest {
-        let target = std::fs::read_link(src)?;
-        if !rw_roots.iter().any(|r| src.starts_with(r) && src != r) {
-            return Ok(Some(MountKind::Symlink { target }));
+    if meta.file_type().is_symlink()
+        && src == dest
+        && let (Some(parent), Some(name)) = (src.parent(), src.file_name())
+        && let Some(dir) = resolve_guarded(parent, writable)?
+    {
+        let at = dir.join(name);
+        if !writable.iter().any(|r| at.starts_with(r)) {
+            return Ok(Some(MountKind::Symlink { target: std::fs::read_link(src)? }));
         }
     }
-    let canon = match std::fs::canonicalize(src) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("{}", src.display())),
-    };
-    for root in rw_roots {
-        if src.starts_with(root) && src != root && canon != src {
-            bail!(
-                "{}: refusing to follow a symlink inside the writable directory {} (resolves to {})",
-                src.display(),
-                root.display(),
-                canon.display()
-            );
-        }
-    }
-    Ok(Some(MountKind::Bind { src: canon, writable: false }))
+    // Refuses a symlink under a writable directory, the last component too.
+    Ok(resolve_guarded(src, writable)?.map(|src| MountKind::Bind { src, writable: false }))
 }
 
 /// vssb's system view (read-only /usr, /etc…, fresh /tmp, /proc, /dev),
@@ -903,6 +907,66 @@ mod tests {
             .collect();
         assert!(sizes.len() >= 4, "/tmp, /var/tmp, /run and /dev at least");
         assert!(sizes.iter().all(|s| *s == Some(64 << 20)));
+    }
+
+    /// base/alias -> real; real/work/planted -> base/sentinel, as an earlier
+    /// run with real/work writable could have left it.
+    fn alias_fixture(name: &str) -> PathBuf {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("vssr-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/work/sub")).unwrap();
+        std::fs::create_dir_all(base.join("sentinel")).unwrap();
+        std::os::unix::fs::symlink("real", base.join("alias")).unwrap();
+        std::os::unix::fs::symlink(base.join("sentinel"), base.join("real/work/planted")).unwrap();
+        base
+    }
+
+    fn plan_with(base: &Path, cwd: &str, entries: &[(FsKind, &str)]) -> Result<Plan> {
+        let mut p = Policy::default();
+        p.fs.system = false;
+        let mut o = FsOverrides::default();
+        for (k, e) in entries {
+            o.entries.push((*k, e.replace("@", &base.to_string_lossy())));
+        }
+        Plan::build(&p, &o, &base.join(cwd))
+    }
+
+    #[test]
+    fn writable_aliases_are_one_directory() {
+        let base = alias_fixture("alias");
+        let refused = |entries: &[(FsKind, &str)]| {
+            let e = plan_with(&base, "real/work", entries).unwrap_err().to_string();
+            assert!(e.contains("refusing to follow the symlink"), "{entries:?}: {e}");
+        };
+        // Writable through the alias, exposed through the real path, and the reverse.
+        refused(&[(FsKind::Rw, "@/alias/work:@/real/work"), (FsKind::Ro, "@/real/work/planted:/exposed")]);
+        refused(&[(FsKind::Rw, "@/real/work"), (FsKind::Ro, "@/alias/work/planted:/exposed")]);
+        // Nor does it become a symlink entry when exposed at its own place.
+        refused(&[(FsKind::Rw, "@/real/work"), (FsKind::Ro, "@/alias/work/planted")]);
+        refused(&[(FsKind::Rw, "@/alias/work:@/real/work"), (FsKind::Ro, "@/real/work/planted")]);
+        // A symlink above the writable directory is fine.
+        let plan = plan_with(&base, "alias/work", &[(FsKind::Rw, "@/alias/work"), (FsKind::Ro, "@/alias/work/sub")]).unwrap();
+        let src = |d: &str| plan.mounts.iter().find(|m| m.dest == base.join(d)).map(|m| m.kind.clone());
+        assert_eq!(src("alias/work"), Some(MountKind::Bind { src: base.join("real/work"), writable: true }));
+        assert_eq!(src("alias/work/sub"), Some(MountKind::Bind { src: base.join("real/work/sub"), writable: false }));
+        assert_eq!(plan.writable, vec![base.join("real/work")]);
+        // Outside the writable directories, a symlink at its own place stays one.
+        let plan = plan_with(&base, "real/work", &[(FsKind::Rw, "@/real/work/sub:@/real/work"), (FsKind::Ro, "@/alias")]).unwrap();
+        assert!(plan.mounts.iter().any(|m| m.dest == base.join("alias") && m.kind == MountKind::Symlink { target: "real".into() }));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn binds_reach_vssb_without_symlinks() {
+        let base = alias_fixture("nosym");
+        let plan = plan_with(&base, "real/work", &[(FsKind::Rw, "@/alias/work"), (FsKind::Ro, "@/sentinel"), (FsKind::Tmpfs, "/tmp")]).unwrap();
+        let binds: Vec<_> = plan.sandbox().resolved_mounts().unwrap().into_iter().filter(|m| matches!(m.kind, MountKind::Bind { .. })).collect();
+        assert_eq!(binds.len(), 2);
+        assert!(binds.iter().all(|m| m.no_symlinks));
+        // The system view too.
+        let plan = Plan::build(&Policy::default(), &FsOverrides::default(), Path::new("/usr")).unwrap();
+        assert!(plan.sandbox().resolved_mounts().unwrap().iter().all(|m| m.no_symlinks == matches!(m.kind, MountKind::Bind { .. })));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

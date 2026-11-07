@@ -227,6 +227,52 @@ fn no_mounting_through_symlinks() {
 }
 
 #[test]
+fn no_symlinks_sources_refuse_symlinks() {
+    let d = Dir::new();
+    let data = Dir::new();
+    std::fs::write(data.0.join("f"), "real").unwrap();
+    let via = d.0.join("via");
+    std::os::unix::fs::symlink(&data.0, &via).unwrap();
+    // A symlink as the last component, and one further up.
+    for src in [via.clone(), via.join("f")] {
+        let mut sb = sandbox(&d);
+        sb.mount(Mount::ro_at(&src, "/mnt/x").no_symlinks());
+        let e = sb.spawn(sh(&d, "true")).unwrap_err();
+        assert!(matches!(e, Error::Setup { .. }) && e.to_string().contains("has a symlink in its path"), "{}: {e}", src.display());
+        // Without no_symlinks it's resolved up front.
+        let mut sb = sandbox(&d);
+        sb.mount(Mount::ro_at(&src, "/mnt/x"));
+        assert_eq!(output(&sb, &d, "cat /mnt/x/f 2>/dev/null || cat /mnt/x"), "real");
+    }
+    // The real path is fine with no_symlinks.
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::ro_at(data.0.join("f"), "/mnt/x").no_symlinks());
+    assert_eq!(output(&sb, &d, "cat /mnt/x"), "real");
+}
+
+#[test]
+fn symlinks_are_never_created_in_host_directories() {
+    let d = Dir::new();
+    let link = d.0.join("link");
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::symlink(&link, "/etc"));
+    let e = sb.spawn(sh(&d, "true")).unwrap_err();
+    assert!(e.to_string().contains("won't create it"), "{e}");
+    assert!(std::fs::symlink_metadata(&link).is_err(), "nothing created in the host directory");
+    // ...unless optional, in which case it's skipped.
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::symlink(&link, "/etc").optional());
+    assert_eq!(code(&sb, &d, "test ! -e link && test ! -L link"), 0);
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    // In a tmpfs under the host directory it's fine.
+    std::fs::create_dir(d.0.join("t")).unwrap();
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::tmpfs(d.0.join("t"))).mount(Mount::symlink(d.0.join("t/link"), "/etc"));
+    assert_eq!(output(&sb, &d, "readlink t/link").trim(), "/etc");
+    assert_eq!(std::fs::read_dir(d.0.join("t")).unwrap().count(), 0);
+}
+
+#[test]
 fn missing_sources_are_config_errors() {
     let d = Dir::new();
     let mut sb = sandbox(&d);
@@ -330,6 +376,33 @@ fn pass_fd() {
     assert_eq!(got, "via-fd\n");
     // Only stdio, the passed fd, and the one ls opened.
     assert_eq!(out.split_whitespace().collect::<Vec<_>>(), ["0", "1", "2", "3", "5"], "{out}");
+}
+
+/// A failed exec must still be reported when the passed descriptors cover
+/// every low number (where the internal status pipe may be).
+#[test]
+fn passed_descriptors_dont_hide_exec_errors() {
+    let d = Dir::new();
+    let sb = sandbox(&d);
+    let mut c = Command::new("/nonexistent/cmd");
+    // Sources well above the targets, so the status pipe gets a low number.
+    for t in 3..=200 {
+        let f = std::fs::File::open("/dev/null").unwrap();
+        let hi = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 400) };
+        assert!(hi >= 0);
+        c.pass_fd(t, unsafe { OwnedFd::from_raw_fd(hi) });
+    }
+    let e = sb.spawn(c).unwrap_err();
+    assert!(matches!(e, Error::Exec { .. }), "{e}");
+}
+
+#[test]
+fn descriptor_targets_out_of_range_are_config_errors() {
+    let d = Dir::new();
+    let sb = sandbox(&d);
+    let mut c = sh(&d, "true");
+    c.pass_fd(i32::MAX, std::fs::File::open("/dev/null").unwrap().into());
+    assert!(matches!(sb.spawn(c), Err(Error::Config(_))));
 }
 
 // == lifecycle
@@ -633,6 +706,24 @@ fn pids_limit_and_cgroup_namespace() {
     assert!(out.contains("fork") || out.contains("Resource temporarily unavailable") || out.contains("retry"), "{out}");
 }
 
+/// The scope's values count as in effect (they're compared with the request).
+#[test]
+fn limits_through_the_scope_are_in_effect() {
+    if !limits_available() {
+        return;
+    }
+    let d = Dir::new();
+    for cpus in [0.5, 1.2345549] {
+        let mut sb = sandbox(&d);
+        let l = Limits { memory: Some((64 << 20) + 1), cpus: Some(cpus), cpu_method: vssb::CpuMethod::Cgroup, pids: Some(16), ..Default::default() };
+        sb.strict(true).limits(l);
+        let mut child = sb.spawn(sh(&d, "true")).expect("spawn");
+        let e = child.enforcement().clone();
+        assert_eq!((e.memory, e.cpus, e.pids), (Some(vssb::Via::Cgroup), Some(vssb::Via::Cgroup), Some(vssb::Via::Cgroup)), "{cpus}");
+        child.wait().unwrap();
+    }
+}
+
 #[test]
 fn freeze_through_the_scope() {
     if !limits_available() {
@@ -695,6 +786,14 @@ fn pids_without_a_cgroup_are_exact() {
     child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
     assert!(child.wait().unwrap().success());
     assert_eq!(out.trim(), "8 8");
+    // The smallest limit: init and the program, nothing more.
+    sb.limits(Limits { pids: Some(2), ..Default::default() });
+    let code = "import os\ntry:\n    if os.fork() == 0: os._exit(0)\n    print('forked')\nexcept OSError: print('refused')";
+    let Some(mut child) = spawn_pid_limited(&sb, python(&d, code)) else { return };
+    let mut out = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(out.trim(), "refused");
 }
 
 #[test]
@@ -709,6 +808,10 @@ fn limits_that_need_a_cgroup_are_config_errors_without_one() {
         sb.limits(l.clone());
         assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))), "{l:?}");
     }
+    // pids counts init, so 1 leaves nothing for the program.
+    let mut sb = no_cgroup(&d);
+    sb.limits(Limits { pids: Some(1), ..Default::default() });
+    assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))));
 }
 
 /// The program's CPU list and whether it may widen it to every CPU.

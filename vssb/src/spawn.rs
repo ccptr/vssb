@@ -125,6 +125,16 @@ fn spawn(sb: &Sandbox, cmd: Command) -> Result<Child> {
         }
     })?;
     drop(p);
+    // Off 0-2 like prepare's descriptors (see prepare::above_stdio), or a
+    // later spawn with Stdio::Inherit would hand it to its program.
+    let mut pidfd = pidfd;
+    if pidfd <= 2 {
+        let n = unsafe { libc::fcntl(pidfd, libc::F_DUPFD_CLOEXEC, 3) };
+        if n >= 0 {
+            sys::close(pidfd);
+            pidfd = n;
+        }
+    }
 
     // From here on, returning an error drops `child`, which kills and reaps the sandbox.
     let mut child = Child {
@@ -276,7 +286,7 @@ fn recv_listeners(ctl: &OwnedFd) -> Result<(Vec<TcpListener>, u8)> {
                 let count = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
                 let data = libc::CMSG_DATA(c).cast::<i32>();
                 for k in 0..count {
-                    out.push(TcpListener::from(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(k)))));
+                    out.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(k))));
                 }
             }
             c = libc::CMSG_NXTHDR(&msg, c);
@@ -285,6 +295,8 @@ fn recv_listeners(ctl: &OwnedFd) -> Result<(Vec<TcpListener>, u8)> {
             return Err(Error::Setup { step: "the sandbox exited during setup".into(), source: io::Error::last_os_error() });
         }
     }
+    // Off 0-2, like the pidfd.
+    let out = out.into_iter().map(|f| prepare::above_stdio(f).map(TcpListener::from)).collect::<Result<Vec<_>>>()?;
     Ok((out, buf[1]))
 }
 

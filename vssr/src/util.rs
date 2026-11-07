@@ -1,7 +1,8 @@
 //! Small helpers: parsing of sizes and durations, path expansion, ids and
 //! timestamps.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -19,7 +20,12 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     if !(n.is_finite() && n > 0.0) {
         bail!("invalid duration {s:?}");
     }
-    Ok(Duration::from_secs_f64(n * mult as f64))
+    // n * mult may overflow to infinity; try_from_secs_f64 refuses that too.
+    match Duration::try_from_secs_f64(n * mult as f64) {
+        Ok(d) if !d.is_zero() => Ok(d),
+        Ok(_) => bail!("invalid duration {s:?}: too short"),
+        Err(_) => bail!("invalid duration {s:?}: too long"),
+    }
 }
 
 /// Parses a byte size such as "512M", "4G" or "1048576" (binary units).
@@ -37,7 +43,12 @@ pub fn parse_size(s: &str) -> Result<u64> {
     if !(n.is_finite() && n >= 0.0) {
         bail!("invalid size {s:?}");
     }
-    Ok((n * (1u64 << shift) as f64) as u64)
+    let bytes = n * (1u64 << shift) as f64;
+    // `as` would saturate; 2^64 itself doesn't fit either.
+    if bytes >= u64::MAX as f64 {
+        bail!("invalid size {s:?}: too large");
+    }
+    Ok(bytes as u64)
 }
 
 /// Expands a leading `~` and `$VAR` / `${VAR}` references. `$PWD` is the
@@ -103,6 +114,60 @@ pub fn normalize(p: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Resolves an absolute path like `canonicalize`, but refuses to follow a
+/// symlink that lives (canonically) under one of `writable`, canonical
+/// directories the sandbox can write: it may have planted it there.
+/// Symlinks elsewhere, above a writable directory too, are followed.
+/// Returns the canonical path, or None when a component is missing.
+pub fn resolve_guarded(p: &Path, writable: &[PathBuf]) -> Result<Option<PathBuf>> {
+    if !p.is_absolute() {
+        bail!("{}: not an absolute path", p.display());
+    }
+    // Components still to resolve, the next one last.
+    let mut rest: Vec<OsString> = Vec::new();
+    let push = |rest: &mut Vec<OsString>, q: &Path| {
+        for c in q.components().rev() {
+            match c {
+                Component::Normal(n) => rest.push(n.to_owned()),
+                Component::ParentDir => rest.push("..".into()),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            }
+        }
+    };
+    push(&mut rest, p);
+    let mut out = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(c) = rest.pop() {
+        if c == ".." {
+            out.pop();
+            continue;
+        }
+        let next = out.join(&c);
+        let meta = match std::fs::symlink_metadata(&next) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("{}: {}", p.display(), next.display())),
+        };
+        if !meta.file_type().is_symlink() {
+            out = next;
+            continue;
+        }
+        if let Some(root) = writable.iter().find(|r| next.starts_with(r) && next != **r) {
+            bail!("{}: refusing to follow the symlink {} inside the writable directory {}", p.display(), next.display(), root.display());
+        }
+        hops += 1;
+        if hops > 40 {
+            bail!("{}: too many levels of symbolic links", p.display());
+        }
+        let target = std::fs::read_link(&next).with_context(|| format!("{}", next.display()))?;
+        if target.is_absolute() {
+            out = PathBuf::from("/");
+        }
+        push(&mut rest, &target);
+    }
+    Ok(Some(out))
+}
+
 pub fn random_id() -> String {
     let mut b = [0u8; 6];
     // getrandom(2) cannot fail for this size once the pool is initialised.
@@ -146,6 +211,10 @@ mod tests {
         assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_secs(5400));
         assert!(parse_duration("-1").is_err());
         assert!(parse_duration("abc").is_err());
+        // Too large for a Duration, or overflowing to infinity: errors, not panics.
+        assert!(parse_duration("1e300").is_err());
+        assert!(parse_duration("1e307d").is_err());
+        assert!(parse_duration("1e-300").is_err());
     }
 
     #[test]
@@ -154,6 +223,38 @@ mod tests {
         assert_eq!(parse_size("4G").unwrap(), 4 << 30);
         assert_eq!(parse_size("512MiB").unwrap(), 512 << 20);
         assert_eq!(parse_size("1.5k").unwrap(), 1536);
+        assert!(parse_size("1e300").is_err());
+        assert!(parse_size("16777216T").is_err()); // 2^64
+        assert_eq!(parse_size("16777215T").unwrap(), 16777215 << 40);
+    }
+
+    #[test]
+    fn guarded_resolution() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("vssr-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (real, out) = (base.join("real"), base.join("out"));
+        std::fs::create_dir_all(real.join("w/sub")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::os::unix::fs::symlink("real", base.join("alias")).unwrap();
+        std::os::unix::fs::symlink(&out, real.join("w/planted")).unwrap();
+        std::os::unix::fs::symlink("sub/../sub", real.join("w/rel")).unwrap();
+        std::os::unix::fs::symlink("loop", base.join("loop")).unwrap();
+        let none: &[PathBuf] = &[];
+        let w = &[real.join("w")];
+        // Without writable directories it is canonicalize.
+        assert_eq!(resolve_guarded(&base.join("alias/w/planted"), none).unwrap(), Some(out.clone()));
+        assert_eq!(resolve_guarded(&base.join("alias/w/rel/../sub"), none).unwrap(), Some(real.join("w/sub")));
+        assert_eq!(resolve_guarded(&base.join("alias/w/missing/x"), none).unwrap(), None);
+        assert!(resolve_guarded(&base.join("loop"), none).is_err());
+        // A symlink above the writable directory is fine, one inside it isn't,
+        // however the path is spelt.
+        assert_eq!(resolve_guarded(&base.join("alias/w/sub"), w).unwrap(), Some(real.join("w/sub")));
+        assert_eq!(resolve_guarded(&base.join("alias/w"), w).unwrap(), Some(real.join("w")));
+        for p in ["real/w/planted", "alias/w/planted", "alias/w/rel", "real/w/sub/../planted/x"] {
+            let e = resolve_guarded(&base.join(p), w).unwrap_err().to_string();
+            assert!(e.contains("refusing to follow the symlink"), "{p}: {e}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

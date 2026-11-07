@@ -35,11 +35,16 @@ pub struct Mount {
     /// Skip silently when the source doesn't exist (or, inside a host
     /// directory, when the mount point is missing).
     pub optional: bool,
+    /// Refuse a bind source with a symlink anywhere in its path instead of
+    /// resolving it. For callers that resolved the path themselves and
+    /// checked where it leads: a symlink planted since then is an error,
+    /// not a new destination.
+    pub no_symlinks: bool,
 }
 
 impl Mount {
     fn new(dest: impl Into<PathBuf>, kind: MountKind) -> Mount {
-        Mount { dest: dest.into(), kind, noexec: false, optional: false }
+        Mount { dest: dest.into(), kind, noexec: false, optional: false, no_symlinks: false }
     }
 
     /// A host path, read-only, at the same place inside.
@@ -72,6 +77,8 @@ impl Mount {
         Mount { optional: true, ..Mount::new(path, MountKind::Deny) }
     }
 
+    /// A symlink at `dest`. Like mount points, it is only created in
+    /// filesystems vssb made, never inside a bind mount (the host's).
     pub fn symlink(dest: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Mount {
         Mount::new(dest, MountKind::Symlink { target: target.into() })
     }
@@ -92,6 +99,12 @@ impl Mount {
 
     pub fn optional(mut self) -> Mount {
         self.optional = true;
+        self
+    }
+
+    /// Sets the `no_symlinks` field: refuse symlinks in the source path.
+    pub fn no_symlinks(mut self) -> Mount {
+        self.no_symlinks = true;
         self
     }
 
@@ -128,8 +141,8 @@ pub struct Limits {
     /// that many CPUs, rounded to the nearest whole number (at least 1).
     /// See [`CpuMethod`].
     pub cpus: Option<f64>,
-    /// Processes and threads, init included: pids.max, or the size of the
-    /// sandbox's PID namespace. See [`PidsMethod`].
+    /// Processes and threads, init included (so at least 2): pids.max, or
+    /// the size of the sandbox's PID namespace. See [`PidsMethod`].
     pub pids: Option<u64>,
     /// How `pids` is enforced.
     pub pids_method: PidsMethod,
@@ -438,8 +451,9 @@ impl Sandbox {
     }
 
     /// The filesystem view as it will be built: system entries merged in,
-    /// paths normalised, sources canonicalised, missing optional entries
-    /// dropped, parents before children.
+    /// paths normalised, sources canonicalised (with `no_symlinks`, only
+    /// normalised), missing optional entries dropped, parents before
+    /// children.
     pub fn resolved_mounts(&self) -> crate::Result<Vec<Mount>> {
         crate::prepare::resolve_mounts(self)
     }

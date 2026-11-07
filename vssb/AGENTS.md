@@ -41,9 +41,12 @@ README.md for the design and the guarantees towards the host program.
   fall back where reasonably possible, each with a method setting and an
   `Enforcement` entry. Which features depend on systemd and which
   fallbacks they get is the user's decision (see the root AGENTS.md).
-- Mount points are opened with `openat2(RESOLVE_NO_SYMLINKS)`, a symlink
-  as the final component is refused too, and vssb never creates entries
-  inside a bind mount (that would write to the host).
+- Mount points, and bind sources (in the child, before `open_tree`), are
+  opened with `openat2(RESOLVE_NO_SYMLINKS)`, a symlink as the final
+  component is refused too, and vssb never creates entries (mount points
+  or symlinks) inside a bind mount (that would write to the host).
+- Descriptors vssb opens are kept off 0-2 (`prepare::above_stdio`), so a
+  caller with stdio closed doesn't hand them to the program as stdio.
 - In the program's process, seccomp is installed last, right before exec.
 - seccomp jumps are 8-bit: keep the final ALLOW reachable, and keep
   `seccomp::tests` passing.
