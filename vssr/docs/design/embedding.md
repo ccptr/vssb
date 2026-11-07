@@ -14,11 +14,10 @@ is covered in [gui.md](gui.md).
   host typed errors, a pidfd and per-run cleanup. What's missing for a
   general host is a C API (it is Rust only) and a policy layer above
   `Sandbox`, if the host wants vssr's policy files.
-- **As a helper binary the client runs (`vssr run`): workable, with
-  small changes.** Exit codes, signals, timeouts and the audit stream
-  work. What's missing is in vssr's CLI, not in the sandbox: vssb can
-  already pass descriptors and join a given cgroup, but vssr has no flags
-  for them, and its plan and `check` output are for people only.
+- **As a helper binary the client runs (`vssr run`): workable.** Exit
+  codes, signals, timeouts and the audit stream work, and the client can
+  pass descriptors in, choose the cgroup, keep vssr off stderr and read
+  the plan and `check` as JSON.
 - **For games specifically: not ready.** The sandbox has no 32-bit
   syscalls, no GPU, no `/sys`, no display or audio sockets, no input
   devices and no filtered UDP, and container runtimes like the Steam
@@ -63,7 +62,7 @@ Gaps for a host:
 | Gap | Where | Why it matters |
 |---|---|---|
 | Rust only: no C ABI, no `cdylib` | `vssb/src/lib.rs` | A C or C++ client needs a small FFI crate (opaque `Sandbox`, `Command` and `Child` handles, the pidfd, errors as codes and strings). |
-| Limits run `busctl` as an ordinary child | `vssb/src/cgroup.rs:78` | `std::process` waits for that pid alone, so a host that reaps with `waitpid(-1)` can take its status first. The scope then counts as failed: cpus and pids use their fallbacks, and a memory limit fails the spawn in strict mode (the default) or is dropped without it. `Cgroup::Join` or the fallbacks alone (`Cgroup::Inherit`) avoid it; a D-Bus call without a subprocess would fix it. |
+| Limits run `busctl` as an ordinary child | `vssb/src/cgroup.rs:78` | `std::process` waits for that pid alone, so a host that reaps with `waitpid(-1)` can take its status first. The scope then counts as failed: cpus and pids use their fallbacks, and a memory limit fails the spawn in strict mode (the default) or is dropped without it. `Cgroup::Join` (`--cgroup`) or the fallbacks alone (`Cgroup::Inherit`) avoid it; a D-Bus call without a subprocess would fix it. |
 | No policy layer in the library | `vssr/src/policy.rs` | vssr's `Policy` → `Plan` lives in the binary crate and reads `$HOME` and the working directory itself (`policy.rs:327`). A host that wants vssr's policy files would need it split out with explicit inputs. A host with its own configuration builds a `Sandbox` directly and needs none of it. |
 | AppArmor on Ubuntu 24.04+ | vssb README | Unprivileged user namespaces need a profile for the binary that creates them, so in-process use puts the whole client under that profile. A helper binary keeps the profile small. |
 | Forking without exec during a spawn | vssb README | The forked copy keeps the control socket open, so `spawn` waits until it exits or execs (`std::process` has the same property). |
@@ -91,23 +90,18 @@ What already works:
   symlinks and anything but a regular file.)
 - `--quiet` keeps vssr's messages off stderr; they are events instead.
 - `-p /proc/self/fd/N` reads the policy from a pipe the client holds.
+- `--pass-fd N[:M]` hands the game the client's descriptor N as M (for
+  example a pre-connected IPC socket); nothing else is inherited.
+- `--cgroup DIR` starts the sandbox in a cgroup the client prepared
+  (a delegated subtree), with the limits written to it: a memory limit
+  without systemd, and no `busctl` subprocess.
+- `--dry-run --json` and `vssr check --json` print the plan and the
+  kernel's support for programs (environment variables by name only).
 - Several sandboxes can run at once, each in its own namespaces.
 
 Gaps, roughly by importance:
 
-1. **No way to pass file descriptors in.** vssb has
-   `Command::pass_fd`, vssr has no flag. A client usually wants to hand
-   the game a pre-connected IPC socket. Suggestion: `--pass-fd N[:M]`.
-   That is cleaner than exposing sockets by path, and it doesn't
-   conflict with the Landlock rule against connecting to sockets.
-2. **No machine-readable plan or check.** `--dry-run` and `vssr check`
-   print text meant for people, and `Plan` doesn't derive `Serialize`.
-   Suggestion: `--json` on both (`check` maps onto `vssb::probe`).
-3. **No way to join the client's cgroup.** vssb has `Cgroup::Join`,
-   vssr always tries a systemd user scope (falling back to pinning and
-   the PID namespace for cpus and pids). Suggestion: `--cgroup PATH`
-   (it also avoids the `busctl` subprocess).
-4. **Defaults meant for an agent in a project.** The default policy
+1. **Defaults meant for an agent in a project.** The default policy
    runs the `cargo` detector on the working directory and refuses a
    working directory that contains `$HOME`. Game policies should set
    `detect.enable = []`, and the client should always pass `-p`.
@@ -137,11 +131,9 @@ left behind, freezing a paused game, and the audit trail.
 
 ## 4. Suggested order of work
 
-1. **Integration contract for `vssr run`** (small; useful to every
-   embedder, not only games): `--pass-fd`, `--cgroup`, `--json` for
-   `check` and `--dry-run`. One integration test per guarantee, as
-   AGENTS.md asks. (Done: `--audit-fd`, `--quiet`, and documenting
-   `-p /proc/self/fd/N` and `start` as the ready event.)
+1. ~~Integration contract for `vssr run`~~ (done 2026-11-07:
+   `--audit-fd`, `--quiet`, `--pass-fd`, `--cgroup`, `--json`, and
+   `-p /proc/self/fd/N` and `start` as the ready event documented).
 2. **Limits without a subprocess**: create the scope over D-Bus from
    vssb itself instead of running `busctl`, so a host's `waitpid(-1)`
    can't interfere.

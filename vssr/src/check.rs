@@ -5,7 +5,10 @@ use crate::policy::Plan;
 use anyhow::Result;
 use vssb::seccomp::Filter;
 
-pub fn run(plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
+pub fn run(json: bool, plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
+    if json {
+        return run_json(plan);
+    }
     let mut ok = true;
     let mut line = |good: bool, name: &str, detail: String| {
         ok &= good;
@@ -44,5 +47,31 @@ pub fn run(plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
             ok = false;
         }
     }
+    Ok(if ok { 0 } else { 1 })
+}
+
+/// `vssr check --json`: the same facts for programs. `ok` is false when the
+/// default (strict) settings can't start or the policy doesn't resolve.
+fn run_json(plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
+    let s = vssb::probe();
+    let f = Filter::build(&[], &[])?;
+    let mut ok = s.user_namespaces && s.landlock_abi > 0 && s.seccomp;
+    let mut out = serde_json::json!({
+        "kernel": s.kernel,
+        "user_namespaces": s.user_namespaces,
+        "landlock_abi": s.landlock_abi,
+        "seccomp": s.seccomp,
+        "seccomp_denied": f.denied().len(),
+        "systemd_user": s.systemd_user,
+    });
+    match plan() {
+        Ok(p) => out["plan"] = p.to_json(),
+        Err(e) => {
+            out["policy_error"] = format!("{e:#}").into();
+            ok = false;
+        }
+    }
+    out["ok"] = ok.into();
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(if ok { 0 } else { 1 })
 }

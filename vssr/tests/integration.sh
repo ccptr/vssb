@@ -71,6 +71,24 @@ expect "  ...and needs an audit log"             125 -- run -q -- true
 # A policy passed on a descriptor (a pipe), without a temporary file.
 out=$("$V" run -p /proc/self/fd/4 -- cat /proc/sys/kernel/hostname 4< <(printf '%s\n' '[fs]' 'rw = ["$PWD"]' '[sandbox]' 'hostname = "from-fd"') 2>&1)
 [ "$out" = from-fd ] && ok "a policy can come from a pipe (-p /proc/self/fd/N)" || bad "a policy can come from a pipe (-p /proc/self/fd/N)" "$out"
+# Descriptors handed to the program, and only those.
+out=$("$V" run --pass-fd 5 --pass-fd 6:9 -- sh -c 'echo five >&5; echo nine >&9; [ -e /proc/$$/fd/6 ] || echo no6; [ -e /proc/$$/fd/7 ] || echo no7' \
+    5>"$WORK/fd5" 6>"$WORK/fd9" 7>/dev/null 2>&1)
+[ "$(cat "$WORK/fd5")" = five ] && [ "$(cat "$WORK/fd9")" = nine ] && [ "$out" = "$(printf 'no6\nno7')" ] \
+    && ok "--pass-fd hands descriptors over, renumbered with N:M, and nothing else" || bad "--pass-fd hands descriptors over, renumbered with N:M, and nothing else" "$out"
+expect "  ...not as stdio"                       125 -- run --pass-fd 5:1 -- true
+expect "  ...not one that isn't open"            125 -- run --pass-fd 9 -- true
+"$V" run --audit-fd 5 --pass-fd 5 -- true 5>/dev/null 2>/dev/null; [ $? = 125 ] \
+    && ok "  ...and not the audit descriptor" || bad "  ...and not the audit descriptor"
+# Plans and checks for programs.
+"$V" run --dry-run --json --allow example.com -e FOO=secret-value -- true > "$WORK/plan.json" 2>&1
+python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["command"]==["true"] and p["net"]["allow"]==["example.com"] and "FOO" in p["env"], p; assert any(m["kind"]=="rw" for m in p["mounts"])' "$WORK/plan.json" \
+    && ! grep -q secret-value "$WORK/plan.json" \
+    && ok "--dry-run --json prints the plan, without variable values" || bad "--dry-run --json prints the plan, without variable values" "$(head -c 300 "$WORK/plan.json")"
+"$V" check --json > "$WORK/check.json" 2>&1; code=$?
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["ok"] == (sys.argv[2] == "0") and "landlock_abi" in c and "plan" in c, c' "$WORK/check.json" $code \
+    && ok "check --json reports support and the plan" || bad "check --json reports support and the plan" "$(head -c 300 "$WORK/check.json")"
+expect "--json needs --dry-run"                  125 -- run --json -- true
 ( cd ~ && "$V" run -- true >/dev/null 2>&1 ); [ $? = 125 ] && ok "refuses to run from \$HOME with the default policy" || bad "refuses to run from \$HOME with the default policy"
 expect_out "own PID namespace"         '^2$' -- run -- sh -c 'echo $$'
 expect_out "own hostname"              '^vssr$' -- run -- cat /proc/sys/kernel/hostname
@@ -490,6 +508,25 @@ expect_out "cpus fallback pins plainly with --no-strict"       '^1 widened$' -- 
 grep '"event":"start"' "$WORK/limits.jsonl" | grep -q '"cpus":{"forced":true,"pinned":\[[0-9]*\]}' \
     && grep '"event":"start"' "$WORK/limits.jsonl" | grep -Eq '"pids":"(pid-namespace|none)"' \
     && ok "the start event says how limits apply" || bad "the start event says how limits apply" "$(cat "$WORK/limits.jsonl" 2>/dev/null)"
+# A cgroup the caller prepared: limits through it without a systemd scope
+# (the bus stays hidden). systemd-run only provides the delegated subtree.
+cat > "$WORK/cg.sh" <<'EOF'
+cg=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
+mkdir "$cg/supervisor" "$cg/sandbox" && echo $$ > "$cg/supervisor/cgroup.procs" && echo "+memory +pids" > "$cg/cgroup.subtree_control" || exit 99
+"$1" run --cgroup "$cg/sandbox" --memory 64M --pids 32 --audit-log "$2/cg.jsonl" -- true || exit 98
+"$1" run --cgroup "$cg/sandbox" --memory 64M -- python3 -c 'b = bytearray(512 << 20); b[::4096] = b"x" * (len(b) // 4096)'
+EOF
+if systemd-run --user --scope -q -- true 2>/dev/null; then
+    systemd-run --user --scope -q -p Delegate=yes -- bash "$WORK/cg.sh" "$V" "$WORK" >/dev/null 2>&1; code=$?
+    [ $code = 137 ] && ok "--cgroup: the memory limit holds in a given cgroup, without systemd" || bad "--cgroup: the memory limit holds in a given cgroup, without systemd" "exit $code"
+    grep '"event":"start"' "$WORK/cg.jsonl" 2>/dev/null | grep -q '"limits":{"memory":"cgroup","pids":"cgroup"}' \
+        && ok "  ...and the start event says so" || bad "  ...and the start event says so" "$(cat "$WORK/cg.jsonl" 2>/dev/null)"
+else
+    echo " --   --cgroup skipped (no systemd user manager to delegate a cgroup)"
+fi
+mkdir -p "$WORK/notcg"
+expect "--cgroup refuses a directory that isn't a cgroup" 125 -- run --cgroup "$WORK/notcg" --memory 64M -- true
+[ -z "$(ls -A "$WORK/notcg")" ] && ok "  ...and writes nothing into it" || bad "  ...and writes nothing into it" "$(ls -A "$WORK/notcg")"
 V=$REAL_V
 cat > pin.toml <<EOF
 [fs]

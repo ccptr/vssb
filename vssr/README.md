@@ -37,7 +37,8 @@ resolves.
 - Unprivileged user namespaces enabled (the default on most distributions;
   Ubuntu 24.04+ restricts them through AppArmor and needs a profile).
 - x86_64 or aarch64.
-- For a memory limit: `busctl` and a systemd user manager. Without one,
+- For a memory limit: `busctl` and a systemd user manager, or a cgroup
+  you prepared (`--cgroup`). Without either,
   `cpus` pins the sandbox to that many CPUs and `pids` sizes its PID
   namespace (Linux 6.14+) instead; see vssb's README for the details.
 
@@ -62,14 +63,16 @@ vssr run [OPTIONS] -- COMMAND [ARGS...]
       --audit-log FILE   JSON-lines audit log
       --audit-fd N       write the audit events to inherited descriptor N instead
   -q, --quiet            vssr's own messages go only to the audit log, not stderr
+      --pass-fd N[:M]    hand inherited descriptor N to the program as M (3+)
+      --cgroup DIR       start in this cgroup v2 directory instead of a systemd scope
       --tty              keep the terminal (interactive use)
       --detect-within DIR  expose detected build dependencies under DIR (read-only)
       --detect-within-rw DIR  the same, read-write
       --detect-project off|ro|rw  detected dependencies in the same git repository (default ro)
       --no-detect        don't read the project's build files for extra rules
       --no-strict        run even if Landlock or limits can't be enforced
-      --dry-run          print the resolved plan and exit
-vssr check [same options]  kernel support + resolved plan
+      --dry-run          print the resolved plan and exit (--json: for programs)
+vssr check [same options]  kernel support + resolved plan (--json: for programs)
 vssr policy                print the built-in default policy
 ```
 
@@ -226,7 +229,14 @@ With `--quiet`, vssr writes nothing to stderr once the log is open, so
 stderr carries only the program's own. Errors before that (a bad policy, a
 log that can't be opened) still go to stderr, with exit 125 and no event.
 A policy can come from a descriptor too: `-p /proc/self/fd/N` reads a
-pipe, so no temporary file is needed.
+pipe, so no temporary file is needed. `--pass-fd N[:M]` gives the program
+descriptor N (say, a pre-connected socket) as M; it inherits nothing
+else, and the audit descriptor can't be passed. `--cgroup DIR` starts the
+sandbox in a cgroup the caller prepared, for example in a subtree
+delegated with `systemd-run --user --scope -p Delegate=yes`; the limits
+are written to it, so a memory limit works without a systemd scope.
+`--dry-run --json` and `vssr check --json` print the plan (environment
+variables by name only) and what the kernel supports.
 
 ## Examples
 

@@ -114,6 +114,17 @@ struct RunArgs {
     /// Send vssr's own messages only to the audit log, not to stderr
     #[arg(short, long)]
     quiet: bool,
+    /// Hand inherited descriptor N to the program as descriptor M (3 or
+    /// above; default N), e.g. a pre-connected socket
+    #[arg(long, value_name = "N[:M]")]
+    pass_fd: Vec<String>,
+    /// Start in this existing cgroup v2 directory (e.g. in a delegated
+    /// subtree) instead of a systemd user scope; limits are written to it
+    #[arg(long, value_name = "DIR")]
+    cgroup: Option<PathBuf>,
+    /// With --dry-run or check: print JSON for programs
+    #[arg(long)]
+    json: bool,
     /// Keep the controlling terminal (for interactive use)
     #[arg(long)]
     tty: bool,
@@ -147,7 +158,7 @@ fn main() {
             print!("{}", policy::DEFAULT_POLICY);
             0
         }
-        Cmd::Check(args) => match check::run(|| resolve(&args)) {
+        Cmd::Check(args) => match check::run(args.json, || resolve(&args)) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("vssr: {e:#}");
@@ -254,7 +265,42 @@ fn resolve(args: &RunArgs) -> Result<Plan> {
     if !args.command.is_empty() {
         p.command = args.command.clone();
     }
-    Plan::build(&p, &fs, &cwd)
+    let mut plan = Plan::build(&p, &fs, &cwd)?;
+    plan.cgroup = args.cgroup.as_ref().map(|c| cwd.join(c));
+    Ok(plan)
+}
+
+/// `--pass-fd N[:M]`: copies of the caller's descriptors, by target.
+fn passed_fds(specs: &[String], audit_fd: Option<i32>) -> Result<Vec<(i32, OwnedFd)>> {
+    let mut out: Vec<(i32, OwnedFd)> = vec![];
+    for spec in specs {
+        let parse = |s: &str| s.parse::<i32>().ok().filter(|&n| n >= 0);
+        let (n, m) = match spec.split_once(':') {
+            Some((n, m)) => (parse(n), parse(m)),
+            None => (parse(spec), parse(spec)),
+        };
+        let (Some(n), Some(m)) = (n, m) else { bail!("--pass-fd {spec}: expected N or N:M (descriptor numbers)") };
+        if m < 3 {
+            bail!("--pass-fd {spec}: the program's descriptor must be 3 or above (0-2 are its stdio)");
+        }
+        if out.iter().any(|(t, _)| *t == m) {
+            bail!("--pass-fd {spec}: descriptor {m} is already passed");
+        }
+        if audit_fd == Some(n) {
+            bail!("--pass-fd {spec}: {n} is the audit descriptor; the program could write events to it");
+        }
+        let copy = unsafe { libc::fcntl(n, libc::F_DUPFD_CLOEXEC, 3) };
+        if copy < 0 {
+            bail!("--pass-fd {spec}: descriptor {n}: {}", std::io::Error::last_os_error());
+        }
+        // The program gets the copy; keep the original out of helpers vssr runs.
+        if n > 2 {
+            let fl = unsafe { libc::fcntl(n, libc::F_GETFD) };
+            unsafe { libc::fcntl(n, libc::F_SETFD, fl | libc::FD_CLOEXEC) };
+        }
+        out.push((m, unsafe { OwnedFd::from_raw_fd(copy) }));
+    }
+    Ok(out)
 }
 
 fn run(args: RunArgs) -> Result<i32> {
@@ -262,13 +308,21 @@ fn run(args: RunArgs) -> Result<i32> {
     if plan.quiet && plan.audit_log.is_none() && args.audit_fd.is_none() {
         bail!("quiet (--quiet, audit.quiet) sends vssr's messages to the audit log, and there is none (--audit-log, --audit-fd)");
     }
+    if args.json && !args.dry_run {
+        bail!("--json goes with --dry-run (or `vssr check`)");
+    }
     if args.dry_run {
-        print!("{}", plan.describe());
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&plan.to_json())?);
+        } else {
+            print!("{}", plan.describe());
+        }
         return Ok(0);
     }
     if plan.argv.is_empty() {
         bail!("no command given (vssr run [OPTIONS] -- COMMAND, or `command` in the policy)");
     }
+    let fds = passed_fds(&args.pass_fd, args.audit_fd)?;
     let id = std::env::var("VSSR_ID").unwrap_or_else(|_| util::random_id());
     let audit = Arc::new(match args.audit_fd {
         Some(fd) => Audit::from_fd(fd, id.clone(), plan.quiet).context("--audit-fd")?,
@@ -278,7 +332,7 @@ fn run(args: RunArgs) -> Result<i32> {
         audit.say("note", json!({"text": n}), n);
     }
     // From here on, failures are events too (and stay off stderr if quiet).
-    supervise(&plan, &id, &audit).or_else(|e| {
+    supervise(&plan, &id, &audit, fds).or_else(|e| {
         let msg = format!("{e:#}");
         audit.say("error", json!({"error": msg, "code": EXIT_SETUP}), &msg);
         Ok(EXIT_SETUP)
@@ -298,7 +352,7 @@ fn sigset(sigs: &[libc::c_int]) -> libc::sigset_t {
 
 /// Starts the sandbox and stays with it until it exits: serves the proxy,
 /// forwards signals, enforces the timeout and writes the audit log.
-fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>) -> Result<i32> {
+fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>) -> Result<i32> {
 
     // Forwarded signals arrive on a signalfd. Block them before any thread
     // starts, so the proxy's threads inherit the mask and never take one.
@@ -311,7 +365,11 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>) -> Result<i32> {
     let sfd = unsafe { OwnedFd::from_raw_fd(sfd) };
 
     let started = Instant::now();
-    let mut child = match plan.sandbox().spawn(plan.command(id)) {
+    let mut cmd = plan.command(id);
+    for (target, fd) in fds {
+        cmd.pass_fd(target, fd);
+    }
+    let mut child = match plan.sandbox().spawn(cmd) {
         Ok(c) => c,
         Err(e) => {
             let code = e.shell_code();

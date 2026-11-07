@@ -49,6 +49,8 @@ into a `vssb::Sandbox` and `vssb::Command`.
   way are made with `mkdirat` from the pinned parent, never by path.
   `--audit-fd` takes a descriptor the caller passed in instead, so no path
   is involved; vssr writes to a close-on-exec copy.
+- `--pass-fd` hands the program copies of the caller's descriptors; the
+  audit descriptor is never one of them (the program could forge events).
 - vssr's own messages go through `Audit::say` (an event, and stderr unless
   quiet), never straight to stderr once the log is open.
 - The forwarded signals are blocked before the sandbox or any proxy

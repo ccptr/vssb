@@ -346,6 +346,10 @@ pub struct Plan {
     pub kill_grace: Duration,
     pub net_mode: NetMode,
     pub net: NetPolicy,
+    /// The proxy's rules as the policy spelt them (for `to_json`).
+    pub net_allow: Vec<String>,
+    pub net_deny: Vec<String>,
+    pub net_allow_private: bool,
     pub proxy_port: u16,
     pub tcp_connect: Option<Vec<u16>>,
     pub tcp_bind: Option<Vec<u16>>,
@@ -355,6 +359,9 @@ pub struct Plan {
     pub cpu_method: vssb::CpuMethod,
     pub cpu_choice: vssb::CpuChoice,
     pub pids_method: vssb::PidsMethod,
+    /// An existing cgroup v2 directory to start in (`--cgroup`) instead of
+    /// a systemd user scope.
+    pub cgroup: Option<PathBuf>,
     pub nofile: Option<u64>,
     pub fsize: Option<u64>,
     pub seccomp_allow: Vec<String>,
@@ -525,6 +532,9 @@ impl Plan {
             kill_grace: parse_duration(&policy.sandbox.kill_grace)?,
             net_mode: policy.net.mode,
             net,
+            net_allow: policy.net.allow.clone(),
+            net_deny: policy.net.deny.clone(),
+            net_allow_private: policy.net.allow_private,
             proxy_port: policy.net.proxy_port,
             tcp_connect: policy.net.tcp_connect.clone(),
             tcp_bind: policy.net.tcp_bind.clone(),
@@ -547,6 +557,7 @@ impl Plan {
                 PidsMethodCfg::Cgroup => vssb::PidsMethod::Cgroup,
                 PidsMethodCfg::PidNamespace => vssb::PidsMethod::PidNamespace,
             },
+            cgroup: None,
             nofile: limits.nofile,
             fsize: limits.fsize.as_deref().map(parse_size).transpose()?,
             seccomp_allow: policy.seccomp.allow.clone(),
@@ -581,6 +592,9 @@ impl Plan {
                 cpu_choice: self.cpu_choice.clone(),
                 pids_method: self.pids_method,
             });
+        if let Some(c) = &self.cgroup {
+            sb.cgroup(vssb::Cgroup::Join(c.clone()));
+        }
         match self.net_mode {
             NetMode::Host => sb.net(Net::Host),
             NetMode::None => sb.net(Net::None),
@@ -618,6 +632,87 @@ impl Plan {
             .keep_session(self.tty)
             .id(id);
         c
+    }
+
+    /// The plan for programs (`--dry-run --json`, `vssr check --json`).
+    /// Environment variables are listed by name only: their values may be
+    /// secrets.
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        let mounts: Vec<_> = self
+            .mounts
+            .iter()
+            .map(|m| {
+                let mut o = match &m.kind {
+                    MountKind::Bind { src, writable } => json!({"kind": if *writable { "rw" } else { "ro" }, "src": src}),
+                    MountKind::Tmpfs { size } => json!({"kind": "tmpfs", "size": size}),
+                    MountKind::Deny => json!({"kind": "deny"}),
+                    MountKind::Symlink { target } => json!({"kind": "symlink", "target": target}),
+                    MountKind::Proc => json!({"kind": "proc"}),
+                    MountKind::Dev { shm_size } => json!({"kind": "dev", "shm_size": shm_size}),
+                };
+                o["dest"] = json!(m.dest);
+                o["noexec"] = json!(m.noexec);
+                o["optional"] = json!(m.optional);
+                if let Some(w) = self.detected.get(&m.dest) {
+                    o["detected"] = json!(w);
+                }
+                o
+            })
+            .collect();
+        // As policy files spell them: PinForced -> pin-forced.
+        let method = |m: &dyn std::fmt::Debug| {
+            let mut out = String::new();
+            for (i, c) in format!("{m:?}").chars().enumerate() {
+                if c.is_uppercase() && i > 0 {
+                    out.push('-');
+                }
+                out.push(c.to_ascii_lowercase());
+            }
+            out
+        };
+        json!({
+            "command": self.argv,
+            "cwd": self.cwd,
+            "hostname": self.hostname,
+            "uid": self.uid,
+            "gid": self.gid,
+            "host_uid": self.host_uid,
+            "host_gid": self.host_gid,
+            "mounts": mounts,
+            "net": {
+                "mode": format!("{:?}", self.net_mode).to_lowercase(),
+                "proxy_port": (self.net_mode == NetMode::Proxy).then_some(self.proxy_port),
+                "allow": self.net_allow,
+                "deny": self.net_deny,
+                "allow_private": self.net_allow_private,
+                "tcp_connect": self.tcp_connect,
+                "tcp_bind": self.tcp_bind,
+            },
+            "env": self.env.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            "limits": {
+                "memory": self.memory,
+                "cpus": self.cpus,
+                "cpu_method": method(&self.cpu_method),
+                "cpu_choice": match &self.cpu_choice {
+                    vssb::CpuChoice::List(l) => json!(l),
+                    c => json!(method(c)),
+                },
+                "pids": self.pids,
+                "pids_method": method(&self.pids_method),
+                "nofile": self.nofile,
+                "fsize": self.fsize,
+                "timeout_s": self.timeout.map(|t| t.as_secs_f64()),
+                "kill_grace_s": self.kill_grace.as_secs_f64(),
+            },
+            "cgroup": self.cgroup,
+            "seccomp": {"allow": self.seccomp_allow, "deny": self.seccomp_deny},
+            "strict": self.strict,
+            "tty": self.tty,
+            "audit_log": self.audit_log,
+            "quiet": self.quiet,
+            "notes": self.notes,
+        })
     }
 
     /// Human-readable summary for `vssr check` and `--dry-run`.
@@ -666,6 +761,9 @@ impl Plan {
         if let Some(f) = self.fsize { lim.push(format!("fsize {} MiB", f >> 20)); }
         if let Some(t) = self.timeout { lim.push(format!("timeout {}s", t.as_secs())); }
         let _ = writeln!(s, "limits:   {}", if lim.is_empty() { "none".into() } else { lim.join(", ") });
+        if let Some(c) = &self.cgroup {
+            let _ = writeln!(s, "cgroup:   {}", c.display());
+        }
         let _ = writeln!(s, "strict:   {}  tty: {}", self.strict, self.tty);
         for n in &self.notes {
             let _ = writeln!(s, "note:     {n}");
