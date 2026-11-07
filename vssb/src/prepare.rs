@@ -5,7 +5,8 @@
 //! this memory, so it never has to allocate.
 
 use crate::cgroup;
-use crate::config::{Cgroup, Command, Limits, Mount, MountKind, Net, Sandbox, Stdio};
+use crate::config::{Cgroup, Command, CpuMethod, FreezeMethod, Limits, Mount, MountKind, Net, PidsMethod, Sandbox, Stdio};
+use crate::cpus;
 use crate::error::{Error, Result};
 use crate::landlock;
 use crate::seccomp::Filter;
@@ -84,6 +85,15 @@ pub(crate) struct Prepared {
     pub cap_last: u32,
     pub landlock: Option<landlock::Plan>,
     pub seccomp: Vec<libc::sock_filter>,
+    /// The same filter, also denying sched_setaffinity (forced pinning).
+    pub seccomp_forced: Vec<libc::sock_filter>,
+    /// Affinity mask for pinning (empty: none prepared).
+    pub cpu_mask: Vec<u64>,
+    /// pid_max and ns_last_pid for the PID namespace, as text.
+    pub pid_max: [CString; 2],
+    pub strict: bool,
+    /// Which fallbacks to apply ([`go`] flags), as the parent sent them.
+    pub go: u8,
     pub exec_paths: Vec<CString>,
     pub argv: Vec<*const libc::c_char>,
     pub envp: Vec<*const libc::c_char>,
@@ -94,8 +104,17 @@ pub(crate) struct Prepared {
 
 pub(crate) enum CgroupPlan {
     None,
-    Scope { unit: String },
+    /// `required`: asked for explicitly, so failing is an error in strict mode.
+    Scope { unit: String, required: bool },
     Join { fd: OwnedFd, path: PathBuf },
+}
+
+/// Flags in the parent's go message (and, for the first two, in init's
+/// reply once it has applied them).
+pub(crate) mod go {
+    pub const PID_MAX: u8 = 1;
+    pub const PIN: u8 = 2;
+    pub const FORCED: u8 = 4;
 }
 
 /// What the parent keeps for itself.
@@ -109,6 +128,11 @@ pub(crate) struct Parent {
     pub stderr: Option<File>,
     pub cgroup: CgroupPlan,
     pub limits: Limits,
+    /// The limits that go through a cgroup when there is one.
+    pub cg_limits: Limits,
+    /// The CPUs pinning would use.
+    pub pin: Option<Vec<u32>>,
+    pub freeze: FreezeMethod,
     pub strict: bool,
     pub id: String,
     pub dests: Vec<PathBuf>,
@@ -266,6 +290,9 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
     {
         return Err(Error::Config("cpus must be positive".into()));
     }
+    if sb.limits.pids == Some(0) {
+        return Err(Error::Config("pids must be at least 1".into()));
+    }
 
     // Landlock.
     let abi = sys::landlock_abi();
@@ -280,6 +307,34 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
     let ll = landlock::Plan::new(abi, connect.as_deref(), sb.tcp_bind.as_deref());
 
     let filter = Filter::build(&sb.seccomp_allow, &sb.seccomp_deny)?;
+
+    // Fallbacks for limits without a cgroup, prepared in case they're
+    // needed: spawn decides once it knows whether there is a cgroup.
+    let l = &sb.limits;
+    let pin = match l.cpus {
+        Some(c) if l.cpu_method != CpuMethod::Cgroup => Some(cpus::choose(c, &l.cpu_choice)?),
+        _ => None,
+    };
+    let may_force = pin.is_some() && (l.cpu_method == CpuMethod::PinForced || (l.cpu_method == CpuMethod::Auto && sb.strict));
+    // Not in the filter's name table; by number.
+    let setaffinity = format!("nr:{}", libc::SYS_sched_setaffinity);
+    if may_force && sb.seccomp_allow.contains(&setaffinity) {
+        return Err(Error::Config(format!("forced pinning denies sched_setaffinity, which seccomp_allow allows ({setaffinity})")));
+    }
+    let forced_filter = if may_force {
+        let mut deny = sb.seccomp_deny.clone();
+        deny.push(setaffinity);
+        Some(Filter::build(&sb.seccomp_allow, &deny)?)
+    } else {
+        None
+    };
+    // pid numbers wrap to 300 (not 1) in every PID namespace, so a pid_max
+    // of pids + 299 leaves exactly pids - 1 numbers for the program's
+    // tasks once init has made them wrap, as pids.max would with init.
+    let pid_max = match l.pids {
+        Some(n) if l.pids_method != PidsMethod::Cgroup => Some((n.saturating_add(299)).max(301)),
+        _ => None,
+    };
 
     // Mounts.
     let n = mounts.len();
@@ -407,19 +462,30 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
         }
         None => random_id(),
     };
+    // The limits that go through a cgroup, if there is one.
+    let cg_limits = Limits {
+        memory: l.memory,
+        cpus: l.cpus.filter(|_| matches!(l.cpu_method, CpuMethod::Auto | CpuMethod::Cgroup)),
+        pids: l.pids.filter(|_| l.pids_method != PidsMethod::PidNamespace),
+        ..Default::default()
+    };
     let cgroup = match &sb.cgroup {
-        Cgroup::Inherit if !sb.limits.is_empty() => {
-            return Err(Error::Config("limits need a cgroup: use Cgroup::Auto, SystemdUserScope or Join".into()));
-        }
-        Cgroup::Inherit => CgroupPlan::None,
-        Cgroup::Auto if sb.limits.is_empty() => CgroupPlan::None,
-        Cgroup::Auto | Cgroup::SystemdUserScope => CgroupPlan::Scope { unit: format!("vssb-{id}.scope") },
-        Cgroup::Join(path) => {
-            if let Err(e) = cgroup::write_limits(path, &sb.limits)
-                && sb.strict
-            {
-                return Err(Error::io(format!("setting limits in {}", path.display()), e));
+        Cgroup::Inherit => {
+            let needs = [
+                ("a memory limit", l.memory.is_some()),
+                ("CpuMethod::Cgroup", l.cpus.is_some() && l.cpu_method == CpuMethod::Cgroup),
+                ("PidsMethod::Cgroup", l.pids.is_some() && l.pids_method == PidsMethod::Cgroup),
+            ];
+            if let Some((what, _)) = needs.iter().find(|(_, n)| *n) {
+                return Err(Error::Config(format!("{what} needs a cgroup: use Cgroup::Auto, SystemdUserScope or Join")));
             }
+            CgroupPlan::None
+        }
+        Cgroup::Auto if cg_limits.is_empty() => CgroupPlan::None,
+        Cgroup::Auto => CgroupPlan::Scope { unit: format!("vssb-{id}.scope"), required: false },
+        Cgroup::SystemdUserScope => CgroupPlan::Scope { unit: format!("vssb-{id}.scope"), required: true },
+        Cgroup::Join(path) => {
+            cgroup::write_limits(path, &cg_limits);
             let f = File::options()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
@@ -455,6 +521,14 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
         cap_last,
         landlock: ll,
         seccomp: filter.program().to_vec(),
+        seccomp_forced: forced_filter.as_ref().map(|f| f.program().to_vec()).unwrap_or_default(),
+        cpu_mask: pin.as_deref().map(cpus::mask).unwrap_or_default(),
+        pid_max: match pid_max {
+            Some(m) => [cstr(m.to_string())?, cstr((m - 1).to_string())?],
+            None => [CString::default(), CString::default()],
+        },
+        strict: sb.strict,
+        go: 0,
         exec_paths,
         argv,
         envp,
@@ -469,7 +543,10 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
         stdout,
         stderr,
         cgroup,
-        limits: sb.limits,
+        limits: sb.limits.clone(),
+        cg_limits,
+        pin,
+        freeze: sb.freeze,
         strict: sb.strict,
         id,
         dests: mounts.iter().map(|m| m.dest.clone()).collect(),

@@ -117,15 +117,26 @@ pub enum Net {
     Host,
 }
 
-/// cgroup v2 limits for the whole sandbox.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Limits for the whole sandbox. They go through its cgroup when it has
+/// one; cpus and pids have fallbacks for when it doesn't (see
+/// [`Child::enforcement`](crate::Child::enforcement) for what applied).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Limits {
-    /// memory.max in bytes (swap is disabled when set).
+    /// memory.max in bytes (swap is disabled when set). Needs a cgroup.
     pub memory: Option<u64>,
-    /// CPU quota in cores, e.g. 0.5 or 2.
+    /// CPU limit in cores, e.g. 0.5 or 2: a quota (cpu.max) or pinning to
+    /// that many CPUs, rounded to the nearest whole number (at least 1).
+    /// See [`CpuMethod`].
     pub cpus: Option<f64>,
-    /// pids.max: processes and threads.
+    /// Processes and threads, init included: pids.max, or the size of the
+    /// sandbox's PID namespace. See [`PidsMethod`].
     pub pids: Option<u64>,
+    /// How `pids` is enforced.
+    pub pids_method: PidsMethod,
+    /// How `cpus` is enforced.
+    pub cpu_method: CpuMethod,
+    /// Which CPUs pinning uses.
+    pub cpu_choice: CpuChoice,
 }
 
 impl Limits {
@@ -134,17 +145,107 @@ impl Limits {
     }
 }
 
+/// How the `pids` limit is enforced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PidsMethod {
+    /// pids.max in the sandbox's cgroup when it has one; otherwise the
+    /// PID namespace.
+    #[default]
+    Auto,
+    /// Only pids.max in the sandbox's cgroup.
+    Cgroup,
+    /// Only the PID namespace: init sets its `pid_max` and lets pid
+    /// numbers wrap before the program starts, so exactly that many fit.
+    /// Needs a kernel with a per-namespace `pid_max` (Linux 6.14+).
+    PidNamespace,
+}
+
+/// How the `cpus` limit is enforced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CpuMethod {
+    /// A quota through the sandbox's cgroup when it has one; otherwise
+    /// pinning, forced in strict mode ([`PinForced`](CpuMethod::PinForced)),
+    /// plain with strict off ([`Pin`](CpuMethod::Pin)).
+    #[default]
+    Auto,
+    /// Only a quota through the sandbox's cgroup.
+    Cgroup,
+    /// Pin the sandbox to that many CPUs (`sched_setaffinity`). The
+    /// program sees only those, but may widen its own set again, so this
+    /// is a hint rather than a limit.
+    Pin,
+    /// Pin, and deny `sched_setaffinity` to the program (EPERM), so it
+    /// can't widen the set. Programs that set their own affinity (Wine's
+    /// `SetThreadAffinityMask`, some engines) get an error.
+    PinForced,
+}
+
+/// Which CPUs pinning picks, within the ones the calling thread may use.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CpuChoice {
+    /// As many physical cores as possible (one hyperthread each before
+    /// any second one), rotating from sandbox to sandbox.
+    #[default]
+    Spread,
+    /// As few physical cores as possible (all hyperthreads of a core
+    /// before the next core), rotating from sandbox to sandbox.
+    Pack,
+    /// The first N of these CPU numbers, in this order.
+    List(Vec<u32>),
+}
+
+/// How [`Child::freeze`](crate::Child::freeze) pauses the sandbox.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FreezeMethod {
+    /// The cgroup freezer when the sandbox has a cgroup; otherwise signals.
+    #[default]
+    Auto,
+    /// Only the cgroup freezer (an error without a cgroup).
+    Cgroup,
+    /// SIGSTOP and SIGCONT to every process in the sandbox. Programs can
+    /// tell: a SIGCONT handler runs on resume, and parents see their
+    /// children stop and continue (job-control shells react to that).
+    /// While paused, forwarded SIGCONT and SIGTSTP are held back.
+    Signals,
+}
+
+/// How one limit is in effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// Through the sandbox's cgroup.
+    Cgroup,
+    /// Pinned to these CPUs; `forced` when `sched_setaffinity` is denied.
+    Pinned { cpus: Vec<u32>, forced: bool },
+    /// Through the size of the sandbox's PID namespace.
+    PidNamespace,
+    /// Not in effect (only possible with strict mode off).
+    NotEnforced,
+}
+
+/// How each limit that was set is in effect (`None`: not set).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Enforcement {
+    pub memory: Option<Via>,
+    pub cpus: Option<Via>,
+    pub pids: Option<Via>,
+}
+
 /// Where the sandbox's processes live in the cgroup tree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Cgroup {
-    /// A systemd user scope when [`Limits`] are set; otherwise the
-    /// caller's own cgroup.
+    /// A systemd user scope when a limit that goes through a cgroup is
+    /// set; otherwise the caller's own cgroup. If no scope can be created
+    /// (no systemd user manager), cpus and pids use their fallbacks and
+    /// only a memory limit (or [`CpuMethod::Cgroup`]) fails in strict mode.
     #[default]
     Auto,
-    /// Always the caller's cgroup. Limits can't be set.
+    /// Always the caller's cgroup. Only limits with a fallback (cpus,
+    /// pids) can be set.
     Inherit,
     /// A new transient systemd user scope (`vssb-<id>.scope`), created
-    /// over D-Bus with `busctl`. Also lets [`Child::freeze`](crate::Child::freeze) work.
+    /// over D-Bus with `busctl`, even without limits (for
+    /// [`Child::freeze`](crate::Child::freeze) through the cgroup). In
+    /// strict mode, failing to create it is an error.
     SystemdUserScope,
     /// An existing cgroup v2 directory the caller prepared (for example
     /// in a delegated subtree). The sandbox starts in it directly
@@ -198,6 +299,7 @@ pub struct Sandbox {
     pub(crate) rlimits: Vec<(Resource, u64)>,
     pub(crate) limits: Limits,
     pub(crate) cgroup: Cgroup,
+    pub(crate) freeze: FreezeMethod,
     pub(crate) strict: bool,
 }
 
@@ -225,6 +327,7 @@ impl Sandbox {
             rlimits: Vec::new(),
             limits: Limits::default(),
             cgroup: Cgroup::Auto,
+            freeze: FreezeMethod::Auto,
             strict: true,
         }
     }
@@ -319,6 +422,11 @@ impl Sandbox {
 
     pub fn cgroup(&mut self, c: Cgroup) -> &mut Self {
         self.cgroup = c;
+        self
+    }
+
+    pub fn freeze_method(&mut self, f: FreezeMethod) -> &mut Self {
+        self.freeze = f;
         self
     }
 

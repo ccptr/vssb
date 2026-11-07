@@ -659,3 +659,136 @@ fn probe_reports_support() {
     assert!(s.ready(), "{s:?}");
     assert!(!Path::new(&s.kernel).as_os_str().is_empty());
 }
+
+// == limits without a cgroup (fallbacks)
+
+/// The caller's cgroup: limits can only use their fallbacks.
+fn no_cgroup(dir: &Dir) -> Sandbox {
+    let mut sb = sandbox(dir);
+    sb.cgroup(Cgroup::Inherit);
+    sb
+}
+
+/// Spawns, or None when this kernel can't size a PID namespace.
+fn spawn_pid_limited(sb: &Sandbox, cmd: Command) -> Option<vssb::Child> {
+    match sb.spawn(cmd) {
+        Err(Error::Unsupported(m)) if m.contains("pid_max") => None,
+        r => Some(r.expect("spawn")),
+    }
+}
+
+#[test]
+fn pids_without_a_cgroup_are_exact() {
+    let d = Dir::new();
+    let mut sb = no_cgroup(&d);
+    sb.limits(Limits { pids: Some(10), ..Default::default() });
+    // python itself is one of the 9 tasks the program gets (init is the
+    // 10th); count what fits, twice, with pid numbers wrapping in between.
+    let code = "import os, time\n\
+        def fill():\n    kids = []\n    while True:\n        try: pid = os.fork()\n        except OSError: break\n        if pid == 0: time.sleep(30); os._exit(0)\n        kids.append(pid)\n    for k in kids: os.kill(k, 9); os.waitpid(k, 0)\n    return len(kids)\n\
+        a = fill()\n\
+        for _ in range(50):\n    p = os.fork()\n    if p == 0: os._exit(0)\n    os.waitpid(p, 0)\n\
+        print(a, fill())";
+    let Some(mut child) = spawn_pid_limited(&sb, python(&d, code)) else { return };
+    assert_eq!(child.enforcement().pids, Some(vssb::Via::PidNamespace));
+    let mut out = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(out.trim(), "8 8");
+}
+
+#[test]
+fn limits_that_need_a_cgroup_are_config_errors_without_one() {
+    let d = Dir::new();
+    for l in [
+        Limits { memory: Some(1 << 30), ..Default::default() },
+        Limits { cpus: Some(1.0), cpu_method: vssb::CpuMethod::Cgroup, ..Default::default() },
+        Limits { pids: Some(64), pids_method: vssb::PidsMethod::Cgroup, ..Default::default() },
+    ] {
+        let mut sb = no_cgroup(&d);
+        sb.limits(l.clone());
+        assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))), "{l:?}");
+    }
+}
+
+/// The program's CPU list and whether it may widen it to every CPU.
+fn affinity(sb: &Sandbox, d: &Dir) -> (vssb::Via, String) {
+    let code = "import os\n\
+        mine = sorted(os.sched_getaffinity(0))\n\
+        try:\n    os.sched_setaffinity(0, range(os.cpu_count())); w = 'widened'\n\
+        except PermissionError: w = 'denied'\n\
+        print(','.join(map(str, mine)), w)";
+    let mut child = sb.spawn(python(d, code)).expect("spawn");
+    let via = child.enforcement().cpus.clone().unwrap();
+    let mut out = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    assert!(child.wait().unwrap().success(), "{out}");
+    (via, out.trim().to_string())
+}
+
+#[test]
+fn cpus_without_a_cgroup_pin() {
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+        return;
+    }
+    let d = Dir::new();
+    let pinned = |method, cpus: f64, strict: bool| {
+        let mut sb = no_cgroup(&d);
+        sb.strict(strict).limits(Limits { cpus: Some(cpus), cpu_method: method, ..Default::default() });
+        affinity(&sb, &d)
+    };
+    // Rounded to the nearest whole number, at least 1.
+    for (cpus, n) in [(0.3, 1), (1.4, 1), (1.6, 2)] {
+        let (via, out) = pinned(vssb::CpuMethod::Pin, cpus, true);
+        let (list, widen) = out.split_once(' ').unwrap();
+        assert_eq!(list.split(',').count(), n, "{cpus}: {out}");
+        assert_eq!(via, vssb::Via::Pinned { cpus: list.split(',').map(|c| c.parse().unwrap()).collect(), forced: false });
+        assert_eq!(widen, "widened", "plain pinning is a hint");
+    }
+    let (via, out) = pinned(vssb::CpuMethod::PinForced, 1.0, false);
+    assert!(out.ends_with("denied") && matches!(via, vssb::Via::Pinned { forced: true, .. }), "{out}");
+    // Auto: forced in strict mode, plain without it.
+    assert!(pinned(vssb::CpuMethod::Auto, 1.0, true).1.ends_with("denied"));
+    assert!(pinned(vssb::CpuMethod::Auto, 1.0, false).1.ends_with("widened"));
+}
+
+#[test]
+fn cpu_lists() {
+    let d = Dir::new();
+    let mut sb = no_cgroup(&d);
+    sb.limits(Limits { cpus: Some(1.0), cpu_method: vssb::CpuMethod::Pin, cpu_choice: vssb::CpuChoice::List(vec![0]), ..Default::default() });
+    assert!(affinity(&sb, &d).1.starts_with("0 "));
+    sb.limits(Limits { cpus: Some(1.0), cpu_method: vssb::CpuMethod::Pin, cpu_choice: vssb::CpuChoice::List(vec![100_000]), ..Default::default() });
+    assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))));
+}
+
+/// Lines in a file the sandbox appends to.
+fn lines(p: &Path) -> usize {
+    std::fs::read_to_string(p).map(|s| s.lines().count()).unwrap_or(0)
+}
+
+#[test]
+fn freeze_with_signals() {
+    let d = Dir::new();
+    let ticks = d.0.join("ticks");
+    let mut sb = no_cgroup(&d);
+    sb.freeze_method(vssb::FreezeMethod::Auto);
+    let mut child = sb.spawn(sh(&d, "sh -c 'while :; do echo x >> ticks; sleep 0.02; done' & wait")).unwrap();
+    assert!(eventually(|| lines(&ticks) > 2));
+    child.freeze(true).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let n = lines(&ticks);
+    // A forwarded SIGCONT is held back while paused.
+    child.signal(libc::SIGCONT).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(lines(&ticks), n, "paused, even after SIGCONT");
+    child.freeze(false).unwrap();
+    assert!(eventually(|| lines(&ticks) > n + 2), "resumed");
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let mut sb = no_cgroup(&d);
+    sb.freeze_method(vssb::FreezeMethod::Cgroup);
+    let child = sb.spawn(sh(&d, "sleep 5")).unwrap();
+    assert_eq!(child.freeze(true).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+}

@@ -2,9 +2,9 @@
 
 use crate::cgroup;
 use crate::child;
-use crate::config::{Command, Sandbox};
+use crate::config::{Command, CpuMethod, Enforcement, FreezeMethod, PidsMethod, Sandbox, Via};
 use crate::error::{Error, Result};
-use crate::prepare::{self, CgroupPlan};
+use crate::prepare::{self, CgroupPlan, go};
 use crate::report::{self, Report};
 use crate::sys;
 use std::fmt;
@@ -72,6 +72,8 @@ pub struct Child {
     status: Option<ExitStatus>,
     id: String,
     cgroup: Option<PathBuf>,
+    enforcement: Enforcement,
+    freeze: FreezeMethod,
     listeners: Vec<TcpListener>,
     /// The caller's ends of [`Stdio::Piped`](crate::Stdio::Piped) streams.
     pub stdin: Option<File>,
@@ -130,28 +132,102 @@ fn spawn(sb: &Sandbox, cmd: Command) -> Result<Child> {
         pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
         ctl: parent.ctl,
         status: None,
-        id: parent.id,
+        id: parent.id.clone(),
         cgroup: None,
+        enforcement: Enforcement::default(),
+        freeze: parent.freeze,
         listeners: Vec::new(),
-        stdin: parent.stdin,
-        stdout: parent.stdout,
-        stderr: parent.stderr,
+        stdin: parent.stdin.take(),
+        stdout: parent.stdout.take(),
+        stderr: parent.stderr.take(),
     };
     write_id_maps(pid, parent.uid, parent.gid)?;
+    let mut no_cgroup = "the sandbox has no cgroup".to_string();
     match &parent.cgroup {
-        CgroupPlan::Scope { unit } => child.cgroup = cgroup::enter_scope(pid, unit, &parent.limits, parent.strict)?,
+        CgroupPlan::Scope { unit, required } => match cgroup::enter_scope(pid, unit, &parent.cg_limits) {
+            Ok(dir) => child.cgroup = Some(dir),
+            Err(e) if *required && parent.strict => return Err(Error::Unsupported(format!("{e} (turn strict mode off to run without it)"))),
+            Err(e) => no_cgroup = e,
+        },
         CgroupPlan::Join { path, .. } => child.cgroup = Some(path.clone()),
         CgroupPlan::None => {}
     }
-    sys::send_with_fds(child.ctl.as_raw_fd(), b"G", &[]).map_err(|e| Error::io("starting the sandbox", io::Error::from_raw_os_error(e)))?;
+    let fb = Fallbacks { limits: &parent.limits, cg_limits: &parent.cg_limits, pin: &parent.pin, strict: parent.strict };
+    let (enforcement, flags) = enforce(&fb, child.cgroup.as_deref(), &no_cgroup)?;
+    child.enforcement = enforcement;
+    sys::send_with_fds(child.ctl.as_raw_fd(), &[b'G', flags], &[])
+        .map_err(|e| Error::io("starting the sandbox", io::Error::from_raw_os_error(e)))?;
 
     // EOF means the program was exec'd; a record means a step failed.
     if let Some(rep) = read_report(File::from(parent.status))? {
         let cx = report::Context { dests: &parent.dests, program: &parent.program, listen: &parent.listen };
         return Err(report::to_error(rep, &cx));
     }
-    child.listeners = recv_listeners(&child.ctl)?;
+    let (listeners, applied) = recv_listeners(&child.ctl)?;
+    child.listeners = listeners;
+    // With strict mode off, init skips a fallback the kernel refused.
+    if flags & go::PID_MAX != 0 && applied & go::PID_MAX == 0 {
+        child.enforcement.pids = Some(Via::NotEnforced);
+    }
+    if flags & go::PIN != 0 && applied & go::PIN == 0 {
+        child.enforcement.cpus = Some(Via::NotEnforced);
+    }
     Ok(child)
+}
+
+/// What [`enforce`] needs from the parent's plan.
+struct Fallbacks<'a> {
+    limits: &'a crate::config::Limits,
+    cg_limits: &'a crate::config::Limits,
+    pin: &'a Option<Vec<u32>>,
+    strict: bool,
+}
+
+/// Decides how each limit is enforced, now that it's known whether the
+/// sandbox has a cgroup (`dir`), and which fallbacks init applies.
+fn enforce(parent: &Fallbacks, dir: Option<&Path>, no_cgroup: &str) -> Result<(Enforcement, u8)> {
+    let (l, strict) = (&parent.limits, parent.strict);
+    let took = dir.map(|d| cgroup::in_effect(d, parent.cg_limits)).unwrap_or_default();
+    let why = || match dir {
+        Some(d) => format!("not in effect in {}", d.display()),
+        None => no_cgroup.to_string(),
+    };
+    let unenforced = |what: &str| {
+        if strict {
+            Err(Error::Unsupported(format!("{what} limit: {} (turn strict mode off to run without it)", why())))
+        } else {
+            Ok(Via::NotEnforced)
+        }
+    };
+    let mut flags = 0u8;
+    let mut e = Enforcement::default();
+    if l.memory.is_some() {
+        e.memory = Some(if took.memory { Via::Cgroup } else { unenforced("memory")? });
+    }
+    if l.cpus.is_some() {
+        let mut pin = |forced: bool| {
+            flags |= go::PIN | if forced { go::FORCED } else { 0 };
+            Via::Pinned { cpus: parent.pin.clone().unwrap_or_default(), forced }
+        };
+        e.cpus = Some(match l.cpu_method {
+            _ if took.cpus => Via::Cgroup,
+            CpuMethod::Cgroup => unenforced("cpus")?,
+            CpuMethod::Auto => pin(strict),
+            CpuMethod::Pin => pin(false),
+            CpuMethod::PinForced => pin(true),
+        });
+    }
+    if l.pids.is_some() {
+        e.pids = Some(match l.pids_method {
+            _ if took.pids => Via::Cgroup,
+            PidsMethod::Cgroup => unenforced("pids")?,
+            PidsMethod::Auto | PidsMethod::PidNamespace => {
+                flags |= go::PID_MAX;
+                Via::PidNamespace
+            }
+        });
+    }
+    Ok((e, flags))
 }
 
 fn write_id_maps(pid: i32, uid: u32, gid: u32) -> Result<()> {
@@ -181,7 +257,8 @@ fn read_report(mut f: File) -> Result<Option<Report>> {
     }
 }
 
-fn recv_listeners(ctl: &OwnedFd) -> Result<Vec<TcpListener>> {
+/// The listeners init hands over, and the fallbacks it applied.
+fn recv_listeners(ctl: &OwnedFd) -> Result<(Vec<TcpListener>, u8)> {
     let mut buf = [0u8; 8];
     let mut cbuf = [0u64; 16];
     let mut out = Vec::new();
@@ -204,11 +281,11 @@ fn recv_listeners(ctl: &OwnedFd) -> Result<Vec<TcpListener>> {
             }
             c = libc::CMSG_NXTHDR(&msg, c);
         }
-        if n < 1 || buf[0] != b'L' {
+        if n < 2 || buf[0] != b'L' {
             return Err(Error::Setup { step: "the sandbox exited during setup".into(), source: io::Error::last_os_error() });
         }
     }
-    Ok(out)
+    Ok((out, buf[1]))
 }
 
 impl Child {
@@ -231,6 +308,12 @@ impl Child {
     /// The sandbox's cgroup directory, when it has its own.
     pub fn cgroup(&self) -> Option<&Path> {
         self.cgroup.as_deref()
+    }
+
+    /// How each limit that was set is in effect: through the cgroup, a
+    /// fallback, or (with strict mode off) not at all.
+    pub fn enforcement(&self) -> &Enforcement {
+        &self.enforcement
     }
 
     /// The listening sockets from [`Sandbox::listen_tcp`], in order.
@@ -257,11 +340,20 @@ impl Child {
         }
     }
 
-    /// Stops (`true`) or resumes every process in the sandbox, through
-    /// its cgroup (needs one: a systemd scope or [`Cgroup::Join`](crate::Cgroup::Join)).
+    /// Stops (`true`) or resumes every process in the sandbox, through its
+    /// cgroup's freezer or with signals, as [`Sandbox::freeze_method`] says.
     pub fn freeze(&self, frozen: bool) -> io::Result<()> {
-        let dir = self.cgroup.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "the sandbox has no cgroup of its own"))?;
-        std::fs::write(dir.join("cgroup.freeze"), if frozen { "1" } else { "0" })
+        match (self.freeze, &self.cgroup) {
+            (FreezeMethod::Auto | FreezeMethod::Cgroup, Some(dir)) => std::fs::write(dir.join("cgroup.freeze"), if frozen { "1" } else { "0" }),
+            (FreezeMethod::Cgroup, None) => Err(io::Error::new(io::ErrorKind::Unsupported, "the sandbox has no cgroup of its own")),
+            (FreezeMethod::Auto | FreezeMethod::Signals, _) => {
+                if self.status.is_some() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "the sandbox has already been waited for"));
+                }
+                // Init stops or continues everything else in the sandbox.
+                sys::send_with_fds(self.ctl.as_raw_fd(), &[b'F', frozen as u8], &[]).map_err(io::Error::from_raw_os_error)
+            }
+        }
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {

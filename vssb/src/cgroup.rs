@@ -5,44 +5,44 @@
 //! The child then makes that scope the root of its cgroup namespace.
 
 use crate::config::Limits;
-use crate::error::{Error, Result};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Writes limits into a cgroup directory the caller prepared.
-pub(crate) fn write_limits(dir: &Path, l: &Limits) -> io::Result<()> {
+/// Writes limits into a cgroup directory the caller prepared. Whether
+/// they took is checked afterwards with [`in_effect`].
+pub(crate) fn write_limits(dir: &Path, l: &Limits) {
     if let Some(m) = l.memory {
-        std::fs::write(dir.join("memory.max"), m.to_string())?;
+        let _ = std::fs::write(dir.join("memory.max"), m.to_string());
         // Missing when swap accounting is off; nothing to limit then.
         let _ = std::fs::write(dir.join("memory.swap.max"), "0");
     }
     if let Some(c) = l.cpus {
         let period = 100_000u64;
         let quota = ((c * period as f64).round() as u64).max(1000);
-        std::fs::write(dir.join("cpu.max"), format!("{quota} {period}"))?;
+        let _ = std::fs::write(dir.join("cpu.max"), format!("{quota} {period}"));
     }
     if let Some(p) = l.pids {
-        std::fs::write(dir.join("pids.max"), p.to_string())?;
+        let _ = std::fs::write(dir.join("pids.max"), p.to_string());
     }
-    Ok(())
 }
 
-/// The limits that are not in effect in `dir`.
-fn missing(dir: &Path, l: &Limits) -> Vec<&'static str> {
+/// Which of the limits set in `l` are in effect in a cgroup.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct InEffect {
+    pub memory: bool,
+    pub cpus: bool,
+    pub pids: bool,
+}
+
+pub(crate) fn in_effect(dir: &Path, l: &Limits) -> InEffect {
     let read = |f: &str| std::fs::read_to_string(dir.join(f)).map(|s| s.trim().to_string()).unwrap_or_default();
-    let mut v = Vec::new();
-    if l.memory.is_some() && matches!(read("memory.max").as_str(), "" | "max") {
-        v.push("memory");
+    let set = |f: &str| !matches!(read(f).as_str(), "" | "max");
+    InEffect {
+        memory: l.memory.is_some() && set("memory.max"),
+        cpus: l.cpus.is_some() && !read("cpu.max").starts_with("max") && !read("cpu.max").is_empty(),
+        pids: l.pids.is_some() && set("pids.max"),
     }
-    if l.pids.is_some() && matches!(read("pids.max").as_str(), "" | "max") {
-        v.push("pids");
-    }
-    if l.cpus.is_some() && read("cpu.max").starts_with("max") {
-        v.push("cpu");
-    }
-    v
 }
 
 fn cgroup_of(pid: i32) -> Option<String> {
@@ -51,11 +51,9 @@ fn cgroup_of(pid: i32) -> Option<String> {
 }
 
 /// Moves `pid` into a new systemd user scope `unit` with the limits set.
-/// Returns its cgroup directory, or None when that failed and `strict` is off.
-pub(crate) fn enter_scope(pid: i32, unit: &str, l: &Limits, strict: bool) -> Result<Option<PathBuf>> {
-    let fail = |msg: String| {
-        if strict { Err(Error::Unsupported(format!("{msg} (turn strict mode off to run without limits)"))) } else { Ok(None) }
-    };
+/// Returns its cgroup directory, or why that failed. Which limits took
+/// is checked afterwards with [`in_effect`].
+pub(crate) fn enter_scope(pid: i32, unit: &str, l: &Limits) -> Result<PathBuf, String> {
     let mut props: Vec<String> = Vec::new();
     let mut count = 0;
     let mut prop = |p: &[&str]| {
@@ -87,9 +85,9 @@ pub(crate) fn enter_scope(pid: i32, unit: &str, l: &Limits, strict: bool) -> Res
         .stderr(Stdio::piped())
         .output();
     match out {
-        Err(e) => return fail(format!("running busctl to create a systemd user scope: {e}")),
+        Err(e) => return Err(format!("running busctl to create a systemd user scope: {e}")),
         Ok(o) if !o.status.success() => {
-            return fail(format!("creating systemd user scope {unit}: {}", String::from_utf8_lossy(&o.stderr).trim()));
+            return Err(format!("creating systemd user scope {unit}: {}", String::from_utf8_lossy(&o.stderr).trim()));
         }
         Ok(_) => {}
     }
@@ -103,14 +101,9 @@ pub(crate) fn enter_scope(pid: i32, unit: &str, l: &Limits, strict: bool) -> Res
             break cg;
         }
         if Instant::now() > deadline {
-            return fail(format!("timed out waiting for systemd to move the sandbox into {unit}"));
+            return Err(format!("timed out waiting for systemd to move the sandbox into {unit}"));
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    let dir = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-    let m = missing(&dir, l);
-    if !m.is_empty() && strict {
-        return Err(Error::Unsupported(format!("cgroup limits not in effect ({}) in {}", m.join(", "), dir.display())));
-    }
-    Ok(Some(dir))
+    Ok(Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }

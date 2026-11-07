@@ -12,7 +12,7 @@
 
 use crate::landlock;
 use crate::mounts;
-use crate::prepare::Prepared;
+use crate::prepare::{Prepared, go};
 use crate::report::{self, Report};
 use crate::seccomp;
 use crate::sys::{self, chk, close, errno, raw_fork, send_with_fds, sigset, write_all, MAX_FDS, WALL};
@@ -108,19 +108,22 @@ fn close_others(keep: &[i32]) {
 }
 
 fn setup(p: &mut Prepared) -> Result<(), Report> {
-    // Wait until the parent has written our id maps (and moved us into a cgroup).
-    let mut b = [0u8; 1];
+    // Wait until the parent has written our id maps (and moved us into a
+    // cgroup); it also says which limit fallbacks to apply.
+    let mut b = [0u8; 2];
     let n = loop {
-        let n = unsafe { libc::recv(p.ctl, b.as_mut_ptr().cast(), 1, 0) };
+        let n = unsafe { libc::recv(p.ctl, b.as_mut_ptr().cast(), 2, 0) };
         if n >= 0 || errno() != libc::EINTR {
             break n;
         }
     };
-    if n != 1 || b[0] != b'G' {
+    if n != 2 || b[0] != b'G' {
         return Err(Report::new(report::GO, 0, report::NONE));
     }
+    p.go = b[1];
     // Rooted at the cgroup the parent just put us in.
     chk(unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } as i64).map_err(|e| Report::new(report::CGROUP_NS, e, report::NONE))?;
+    let applied = fallbacks(p)?;
     if !p.keep_session {
         // Our own session, so terminal signals reach only the caller.
         unsafe { libc::setsid() };
@@ -138,13 +141,50 @@ fn setup(p: &mut Prepared) -> Result<(), Report> {
     for (k, (&port, slot)) in p.listen.iter().zip(fds.iter_mut()).enumerate() {
         *slot = listen(port).map_err(|e| Report::new(report::LISTEN, e, k as u32))?;
     }
-    send_with_fds(p.ctl, b"L", fds.get(..n).unwrap_or_default()).map_err(|e| Report::new(report::SEND, e, report::NONE))?;
+    send_with_fds(p.ctl, &[b'L', applied], fds.get(..n).unwrap_or_default()).map_err(|e| Report::new(report::SEND, e, report::NONE))?;
     for fd in fds {
         close(fd);
     }
     // Keeps the program from ptracing PID 1 or reading its memory.
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
     Ok(())
+}
+
+/// Applies the limit fallbacks the parent asked for, before the program's
+/// process exists. Returns the ones that took (with strict mode off, a
+/// refused one is skipped; with it on, it's an error).
+fn fallbacks(p: &Prepared) -> Result<u8, Report> {
+    let mut applied = 0;
+    if p.go & go::PID_MAX != 0 {
+        // pid_max sizes this PID namespace; ns_last_pid = pid_max - 1 makes
+        // the next pid wrap, to 300, so every pid the program's tasks get
+        // is in 300..pid_max and no more than pid_max - 300 of them fit.
+        match write_file(c"/proc/sys/kernel/pid_max", p.pid_max[0].as_bytes())
+            .and_then(|()| write_file(c"/proc/sys/kernel/ns_last_pid", p.pid_max[1].as_bytes()))
+        {
+            Ok(()) => applied |= go::PID_MAX,
+            Err(e) if p.strict => return Err(Report::new(report::PID_MAX, e, report::NONE)),
+            Err(_) => {}
+        }
+    }
+    if p.go & go::PIN != 0 {
+        // Init's own set; the program's process inherits it.
+        let m = &p.cpu_mask;
+        match chk(unsafe { libc::syscall(libc::SYS_sched_setaffinity, 0, m.len() * 8, m.as_ptr()) }) {
+            Ok(_) => applied |= go::PIN,
+            Err(e) if p.strict => return Err(Report::new(report::PIN, e, report::NONE)),
+            Err(_) => {}
+        }
+    }
+    Ok(applied)
+}
+
+fn write_file(path: &core::ffi::CStr, data: &[u8]) -> Result<(), i32> {
+    let fd = sys::chk_fd(unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) } as i64)?;
+    let ok = write_all(fd, data);
+    let e = errno();
+    close(fd);
+    if ok { Ok(()) } else { Err(e) }
 }
 
 fn loopback_up() -> Result<(), i32> {
@@ -202,6 +242,11 @@ fn supervise(p: &Prepared, agent: i32) -> ! {
         unsafe { libc::kill(-1, libc::SIGKILL) };
         exit(EXIT_SETUP);
     }
+    // Paused with signals (FreezeMethod::Signals): forwarded SIGCONT and
+    // SIGTSTP wait until the resume, since either would undo or be undone
+    // by it (SIGCONT discards pending stop signals). The latest is kept.
+    let mut paused = false;
+    let mut held = 0;
     loop {
         let mut pfd = [
             libc::pollfd { fd: sfd, events: libc::POLLIN, revents: 0 },
@@ -219,6 +264,21 @@ fn supervise(p: &Prepared, agent: i32) -> ! {
                 kill_all_and_reap();
                 exit(EXIT_SETUP);
             }
+            if n == 2 && b[0] == b'F' {
+                let pause = b[1] != 0;
+                if pause && !paused {
+                    // Every process in the namespace but init; the kernel
+                    // also stops children forked while this is delivered.
+                    unsafe { libc::kill(-1, libc::SIGSTOP) };
+                } else if !pause && paused {
+                    unsafe { libc::kill(-1, libc::SIGCONT) };
+                    if held != 0 {
+                        unsafe { libc::kill(agent, held) };
+                        held = 0;
+                    }
+                }
+                paused = pause;
+            }
         }
         if pfd[0].revents & libc::POLLIN == 0 {
             continue;
@@ -233,7 +293,9 @@ fn supervise(p: &Prepared, agent: i32) -> ! {
             // With the caller's terminal, the program gets these from the
             // terminal itself (sent by the kernel); don't double them.
             let from_tty = info.ssi_code == SI_KERNEL && matches!(sig, libc::SIGINT | libc::SIGQUIT | libc::SIGTSTP);
-            if !(p.keep_session && from_tty) {
+            if paused && matches!(sig, libc::SIGCONT | libc::SIGTSTP) {
+                held = sig;
+            } else if !(p.keep_session && from_tty) {
                 unsafe { libc::kill(agent, sig) };
             }
             continue;
@@ -324,7 +386,8 @@ fn run_program(p: &mut Prepared) -> (i32, Report) {
     unsafe { libc::syscall(libc::SYS_rt_sigprocmask, libc::SIG_SETMASK, &empty as *const u64, std::ptr::null::<u64>(), 8usize) };
 
     // Last step before exec: from here on the filter applies.
-    if let Err(e) = seccomp::install(&p.seccomp) {
+    let filter = if p.go & go::FORCED != 0 { &p.seccomp_forced } else { &p.seccomp };
+    if let Err(e) = seccomp::install(filter) {
         return fail(report::SECCOMP, e);
     }
     // execvp's search, without its allocation.

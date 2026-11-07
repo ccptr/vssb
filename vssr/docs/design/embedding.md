@@ -46,8 +46,11 @@ What a host gets (details and the test for each in vssb's README):
 - Init closes every descriptor except the ones passed with
   `Command::pass_fd`, so other threads' sockets don't leak in.
 - Limits through a systemd user scope over D-Bus, or
-  `Cgroup::Join(dir)` for a host that manages its own cgroups.
-  `Child::freeze`, `signal`, `terminate(grace)`.
+  `Cgroup::Join(dir)` for a host that manages its own cgroups. Without
+  a cgroup, cpus fall back to pinning, pids to sizing the PID namespace
+  and `Child::freeze` to SIGSTOP/SIGCONT; only a memory limit needs one.
+  `Child::enforcement` says what applied. `Child::signal`,
+  `terminate(grace)`.
 - `probe()` to test what the kernel supports before offering a
   sandboxed launch, and `Error` variants that tell setup failures,
   missing kernel support and exec failures apart.
@@ -60,7 +63,7 @@ Gaps for a host:
 | Gap | Where | Why it matters |
 |---|---|---|
 | Rust only: no C ABI, no `cdylib` | `vssb/src/lib.rs` | A C or C++ client needs a small FFI crate (opaque `Sandbox`, `Command` and `Child` handles, the pidfd, errors as codes and strings). |
-| Limits run `busctl` as an ordinary child | `vssb/src/cgroup.rs:80` | `std::process` waits for that pid alone, so a host that reaps with `waitpid(-1)` can take its status first. With `strict` (the default) the spawn then fails; without it, the game runs without limits. `Cgroup::Join` avoids it; a D-Bus call without a subprocess would fix it. |
+| Limits run `busctl` as an ordinary child | `vssb/src/cgroup.rs:78` | `std::process` waits for that pid alone, so a host that reaps with `waitpid(-1)` can take its status first. The scope then counts as failed: cpus and pids use their fallbacks, and a memory limit fails the spawn in strict mode (the default) or is dropped without it. `Cgroup::Join` or the fallbacks alone (`Cgroup::Inherit`) avoid it; a D-Bus call without a subprocess would fix it. |
 | No policy layer in the library | `vssr/src/policy.rs` | vssr's `Policy` → `Plan` lives in the binary crate and reads `$HOME` and the working directory itself (`policy.rs:327`). A host that wants vssr's policy files would need it split out with explicit inputs. A host with its own configuration builds a `Sandbox` directly and needs none of it. |
 | AppArmor on Ubuntu 24.04+ | vssb README | Unprivileged user namespaces need a profile for the binary that creates them, so in-process use puts the whole client under that profile. A helper binary keeps the profile small. |
 | Forking without exec during a spawn | vssb README | The forked copy keeps the control socket open, so `spawn` waits until it exits or execs (`std::process` has the same property). |
@@ -97,7 +100,8 @@ Gaps, roughly by importance:
    print text meant for people, and `Plan` doesn't derive `Serialize`.
    Suggestion: `--json` on both (`check` maps onto `vssb::probe`).
 3. **No way to join the client's cgroup.** vssb has `Cgroup::Join`,
-   vssr always uses a systemd user scope. Suggestion: `--cgroup PATH`
+   vssr always tries a systemd user scope (falling back to pinning and
+   the PID namespace for cpus and pids). Suggestion: `--cgroup PATH`
    (it also avoids the `busctl` subprocess).
 4. **stderr noise.** "vssr: blocked …", detection notes and warnings are
    mixed into the game's stderr. `audit.quiet` silences only the

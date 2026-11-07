@@ -32,6 +32,7 @@ compile_error!("vssb only supports Linux");
 mod cgroup;
 mod child;
 mod config;
+mod cpus;
 mod error;
 mod landlock;
 mod mounts;
@@ -45,7 +46,10 @@ mod sys;
 #[cfg(feature = "proxy")]
 pub mod proxy;
 
-pub use config::{Cgroup, Command, Limits, Mount, MountKind, Net, Resource, Sandbox, Stdio};
+pub use config::{
+    Cgroup, Command, CpuChoice, CpuMethod, Enforcement, FreezeMethod, Limits, Mount, MountKind, Net, PidsMethod, Resource, Sandbox, Stdio,
+    Via,
+};
 pub use error::{Error, Result};
 pub use probe::{Support, probe};
 pub use spawn::{Child, ExitStatus};

@@ -31,7 +31,7 @@ pub fn run(plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
     let detail = if s.systemd_user {
         "busctl and the systemd user manager are available"
     } else {
-        "no systemd user manager reachable with busctl: memory/cpu/pids limits unavailable"
+        "no systemd user manager reachable with busctl: no memory limit; cpus pin, pids size the PID namespace"
     };
     // Limits are optional, so this never fails the check by itself.
     println!("{} {:<16} {detail}", if s.systemd_user { " ok " } else { " -- " }, "resource limits");

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use vssb::proxy::{self, Event};
+use vssb::{Enforcement, Via};
 
 /// vssr's own failure to set up the sandbox (as vssb reports it too).
 const EXIT_SETUP: i32 = 125;
@@ -85,10 +86,10 @@ struct RunArgs {
     /// Wall-clock limit, e.g. 30m or 2h
     #[arg(long)]
     timeout: Option<String>,
-    /// Memory limit, e.g. 4G (cgroup, via a systemd user scope)
+    /// Memory limit, e.g. 4G (needs a cgroup: a systemd user scope)
     #[arg(long)]
     memory: Option<String>,
-    /// CPU limit in cores, e.g. 2 or 0.5
+    /// CPU limit in cores, e.g. 2 or 0.5 (without a cgroup: pinning to that many CPUs)
     #[arg(long)]
     cpus: Option<f64>,
     /// Maximum number of processes and threads
@@ -295,8 +296,11 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
             return Ok(code);
         }
     };
-    if plan.needs_cgroup() && child.cgroup().is_none() {
-        eprintln!("vssr: warning: no resource limits (no systemd user scope could be created)");
+    let enforced = child.enforcement().clone();
+    for (name, via) in [("memory", &enforced.memory), ("cpus", &enforced.cpus), ("pids", &enforced.pids)] {
+        if *via == Some(Via::NotEnforced) {
+            eprintln!("vssr: warning: the {name} limit is not in effect (no cgroup, and no fallback took)");
+        }
     }
 
     // Stopped (listener and every connection closed) when it goes out of scope.
@@ -317,6 +321,7 @@ fn supervise(plan: &Plan, id: String) -> Result<i32> {
             "host_pid": child.id(),
             "timeout_s": plan.timeout.map(|t| t.as_secs()),
             "detected": plan.detected,
+            "limits": limits_json(&enforced),
             "user": std::env::var("USER").ok(),
         }),
     );
@@ -377,6 +382,23 @@ fn forward_signals(plan: &Plan, sfd: &OwnedFd, child: &vssb::Child, audit: &Audi
         audit.event("signal", json!({"signal": sig}));
         let _ = child.signal(sig);
     }
+}
+
+/// How each limit that was set is enforced, for the start event.
+fn limits_json(e: &Enforcement) -> serde_json::Value {
+    let via = |v: &Via| match v {
+        Via::Cgroup => json!("cgroup"),
+        Via::Pinned { cpus, forced } => json!({"pinned": cpus, "forced": forced}),
+        Via::PidNamespace => json!("pid-namespace"),
+        Via::NotEnforced => json!("none"),
+    };
+    let mut m = serde_json::Map::new();
+    for (name, v) in [("memory", &e.memory), ("cpus", &e.cpus), ("pids", &e.pids)] {
+        if let Some(v) = v {
+            m.insert(name.into(), via(v));
+        }
+    }
+    serde_json::Value::Object(m)
 }
 
 fn net_event(audit: &Audit, e: &Event) {

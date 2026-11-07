@@ -37,6 +37,8 @@ pub(crate) const NO_NEW_PRIVS: u32 = 28;
 pub(crate) const LANDLOCK: u32 = 29;
 pub(crate) const SECCOMP: u32 = 30;
 pub(crate) const EXEC: u32 = 31;
+pub(crate) const PID_MAX: u32 = 32;
+pub(crate) const PIN: u32 = 33;
 
 /// `a` when a step isn't about one mount.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -97,6 +99,13 @@ pub(crate) fn to_error(r: Report, cx: &Context) -> Error {
     let step = match r.step {
         EXEC => return Error::Exec { program: cx.program.to_string(), source: os },
         GO => "waiting for the caller".to_string(),
+        PID_MAX => {
+            return Error::Unsupported(format!(
+                "pids limit: setting the sandbox's pid_max failed ({os}); without a cgroup it needs Linux 6.14+ \
+                 (turn strict mode off to run without it)"
+            ));
+        }
+        PIN => "pinning to CPUs (sched_setaffinity)".into(),
         CGROUP_NS => "creating the cgroup namespace".into(),
         MOUNT_PRIVATE => "making mounts private".into(),
         OPEN_SOURCE => format!("cloning the mount source of {shown}"),

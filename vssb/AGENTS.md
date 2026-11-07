@@ -10,7 +10,9 @@ README.md for the design and the guarantees towards the host program.
 - `src/prepare.rs`: resolves the mounts and builds `Prepared` (everything
   the child needs) and `Parent` (what the caller keeps). All allocation
   happens here.
-- `src/spawn.rs`: `spawn` (clone, id maps, cgroup, go, status) and `Child`.
+- `src/spawn.rs`: `spawn` (clone, id maps, cgroup, deciding how each
+  limit is enforced, go, status) and `Child`.
+- `src/cpus.rs`: picks the CPUs for pinning (the cpus fallback).
 - `src/child.rs`: init (PID 1) and the program's process.
 - `src/mounts.rs`, `src/landlock.rs`: child-side filesystem view and
   Landlock (raw syscalls; the parent works out the rights).
@@ -32,7 +34,13 @@ README.md for the design and the guarantees towards the host program.
 - Init closes all other descriptors first thing. Keep anything the child
   needs in `Prepared::keep_fds`.
 - No process-wide state in the library: no threads (except in `proxy`),
-  no signal handlers, no re-exec, no `waitpid(-1)` in the parent.
+  no signal handlers, no re-exec, no `waitpid(-1)` in the parent. (The
+  only static is `cpus.rs`'s rotation counter, which touches nothing of
+  the host's.)
+- Limits use systemd (or a given cgroup) where nothing else will do, and
+  fall back where reasonably possible, each with a method setting and an
+  `Enforcement` entry. Which features depend on systemd and which
+  fallbacks they get is the user's decision (see the root AGENTS.md).
 - Mount points are opened with `openat2(RESOLVE_NO_SYMLINKS)`, a symlink
   as the final component is refused too, and vssb never creates entries
   inside a bind mount (that would write to the host).

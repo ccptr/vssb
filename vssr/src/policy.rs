@@ -42,6 +42,10 @@ pass = ["PATH", "TERM", "COLORTERM", "LANG", "LANGUAGE", "LC_*", "TZ", "USER", "
 # memory = "8G"
 # cpus = 4
 # pids = 4096
+# Without a cgroup (no systemd user manager), cpus and pids have fallbacks:
+# cpu_method = "auto"    # auto (cgroup quota, else pinning), cgroup, pin, pin-forced
+# cpu_choice = "spread"  # CPUs to pin to: spread, pack, or a list such as [0, 2]
+# pids_method = "auto"   # auto (cgroup, else the PID namespace), cgroup, pid-namespace
 # nofile = 8192
 # fsize = "20G"
 
@@ -185,8 +189,51 @@ pub struct LimitsCfg {
     pub memory: Option<String>,
     pub cpus: Option<f64>,
     pub pids: Option<u64>,
+    pub cpu_method: CpuMethodCfg,
+    pub cpu_choice: CpuChoiceCfg,
+    pub pids_method: PidsMethodCfg,
     pub nofile: Option<u64>,
     pub fsize: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CpuMethodCfg {
+    #[default]
+    Auto,
+    Cgroup,
+    Pin,
+    PinForced,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CpuChoiceName {
+    #[default]
+    Spread,
+    Pack,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CpuChoiceCfg {
+    Name(CpuChoiceName),
+    List(Vec<u32>),
+}
+
+impl Default for CpuChoiceCfg {
+    fn default() -> Self {
+        CpuChoiceCfg::Name(CpuChoiceName::Spread)
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PidsMethodCfg {
+    #[default]
+    Auto,
+    Cgroup,
+    PidNamespace,
 }
 
 /// Rules detected from the project's build files (see `detect.rs`).
@@ -304,6 +351,9 @@ pub struct Plan {
     pub memory: Option<u64>,
     pub cpus: Option<f64>,
     pub pids: Option<u64>,
+    pub cpu_method: vssb::CpuMethod,
+    pub cpu_choice: vssb::CpuChoice,
+    pub pids_method: vssb::PidsMethod,
     pub nofile: Option<u64>,
     pub fsize: Option<u64>,
     pub seccomp_allow: Vec<String>,
@@ -474,6 +524,22 @@ impl Plan {
             memory: limits.memory.as_deref().map(parse_size).transpose()?,
             cpus: limits.cpus,
             pids: limits.pids,
+            cpu_method: match limits.cpu_method {
+                CpuMethodCfg::Auto => vssb::CpuMethod::Auto,
+                CpuMethodCfg::Cgroup => vssb::CpuMethod::Cgroup,
+                CpuMethodCfg::Pin => vssb::CpuMethod::Pin,
+                CpuMethodCfg::PinForced => vssb::CpuMethod::PinForced,
+            },
+            cpu_choice: match &limits.cpu_choice {
+                CpuChoiceCfg::Name(CpuChoiceName::Spread) => vssb::CpuChoice::Spread,
+                CpuChoiceCfg::Name(CpuChoiceName::Pack) => vssb::CpuChoice::Pack,
+                CpuChoiceCfg::List(l) => vssb::CpuChoice::List(l.clone()),
+            },
+            pids_method: match limits.pids_method {
+                PidsMethodCfg::Auto => vssb::PidsMethod::Auto,
+                PidsMethodCfg::Cgroup => vssb::PidsMethod::Cgroup,
+                PidsMethodCfg::PidNamespace => vssb::PidsMethod::PidNamespace,
+            },
             nofile: limits.nofile,
             fsize: limits.fsize.as_deref().map(parse_size).transpose()?,
             seccomp_allow: policy.seccomp.allow.clone(),
@@ -486,10 +552,6 @@ impl Plan {
         })
     }
 
-    pub fn needs_cgroup(&self) -> bool {
-        self.memory.is_some() || self.cpus.is_some() || self.pids.is_some()
-    }
-
     /// The sandbox this plan describes. The view is complete already, so
     /// vssb's own system view stays off.
     pub fn sandbox(&self) -> Sandbox {
@@ -499,7 +561,14 @@ impl Plan {
             .uid(self.uid)
             .gid(self.gid)
             .strict(self.strict)
-            .limits(Limits { memory: self.memory, cpus: self.cpus, pids: self.pids });
+            .limits(Limits {
+                memory: self.memory,
+                cpus: self.cpus,
+                pids: self.pids,
+                cpu_method: self.cpu_method,
+                cpu_choice: self.cpu_choice.clone(),
+                pids_method: self.pids_method,
+            });
         match self.net_mode {
             NetMode::Host => sb.net(Net::Host),
             NetMode::None => sb.net(Net::None),
@@ -579,8 +648,8 @@ impl Plan {
         let _ = writeln!(s, "env:      {}", names.join(" "));
         let mut lim = vec![];
         if let Some(m) = self.memory { lim.push(format!("memory {} MiB", m >> 20)); }
-        if let Some(c) = self.cpus { lim.push(format!("cpus {c}")); }
-        if let Some(p) = self.pids { lim.push(format!("pids {p}")); }
+        if let Some(c) = self.cpus { lim.push(format!("cpus {c} ({:?}, {:?})", self.cpu_method, self.cpu_choice)); }
+        if let Some(p) = self.pids { lim.push(format!("pids {p} ({:?})", self.pids_method)); }
         if let Some(n) = self.nofile { lim.push(format!("nofile {n}")); }
         if let Some(f) = self.fsize { lim.push(format!("fsize {} MiB", f >> 20)); }
         if let Some(t) = self.timeout { lim.push(format!("timeout {}s", t.as_secs())); }

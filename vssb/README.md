@@ -36,7 +36,7 @@ The same layers as vssr:
 | Network | network namespace | `Net::None`: loopback only, plus listeners handed to the host (for the filtering `proxy`). `Net::Host`: the host network, optionally limited to TCP ports by Landlock. |
 | Syscalls | seccomp BPF | No nested namespaces, mount, ptrace, bpf, io_uring, perf, keyrings, kernel modules, raw sockets or TIOCSTI. |
 | Privileges | no_new_privs, empty capability sets | setuid binaries don't escalate; even uid 0 inside has no capabilities. |
-| Resources | cgroup v2, rlimits | Memory, CPU and pids through a systemd user scope or a cgroup you give it. Open files, file size and the rest through rlimits. |
+| Resources | cgroup v2, rlimits, fallbacks | Memory, CPU and pids through a systemd user scope or a cgroup you give it. Without a cgroup, CPU falls back to pinning and pids to sizing the PID namespace (see below). Open files, file size and the rest through rlimits. |
 
 ## What makes it embeddable
 
@@ -85,7 +85,11 @@ are the guarantees towards the host, each with an integration test in
     `tcp_connect(ports)`, `tcp_bind(ports)`.
   - Syscalls: `seccomp_allow(name)`, `seccomp_deny(name)`.
   - Resources: `rlimit(Resource, n)`, `limits(Limits)`,
-    `cgroup(Cgroup::Auto | Inherit | SystemdUserScope | Join(dir))`.
+    `cgroup(Cgroup::Auto | Inherit | SystemdUserScope | Join(dir))`,
+    `freeze_method(FreezeMethod::Auto | Cgroup | Signals)`. `Limits` has
+    `memory`, `cpus` and `pids`, with `cpu_method`, `cpu_choice` and
+    `pids_method` choosing how they're enforced (see "Limits without a
+    cgroup").
   - Ids and the rest: `uid`, `gid`, `hostname`, `strict`.
   - `resolved_mounts()` shows the final view.
 - `Command`: one program.
@@ -99,7 +103,10 @@ are the guarantees towards the host, each with an integration test in
   - Waiting: `wait`, `try_wait`, `wait_timeout`, `pidfd`.
   - Stopping: `signal` (forwarded to the program by init), `kill` (the
     whole sandbox), `terminate(grace)` (SIGTERM, then SIGKILL).
-  - `freeze(bool)` uses the cgroup freezer.
+  - `freeze(bool)` pauses everything: the cgroup freezer, or SIGSTOP and
+    SIGCONT from init (`FreezeMethod`).
+  - `enforcement()` says how each limit is in effect (`Via::Cgroup`,
+    `Pinned`, `PidNamespace`, or `NotEnforced` with strict mode off).
   - `take_listeners`, `cgroup`, and the `stdin`/`stdout`/`stderr` pipes.
   - Dropping a `Child` kills and reaps the sandbox.
 - `ExitStatus`: the program's own status, which init reports. If the
@@ -122,14 +129,34 @@ audit log format and the CLI are front-end concerns, and live in
 `Sandbox` + `Command`, and serves `proxy::serve` with a callback that
 writes the events to its audit log.
 
+## Limits without a cgroup
+
+vssb uses systemd only where nothing else will do, and falls back where
+it reasonably can. When the sandbox gets no cgroup (no systemd user
+manager, or `Cgroup::Inherit`), or a controller isn't in effect in it:
+
+| Limit | Fallback | Method setting |
+|---|---|---|
+| memory | None: no other way to limit a whole sandbox. Strict mode refuses to run; with it off, the program runs without the limit. | — |
+| cpus | Pinning to that many CPUs (`sched_setaffinity` on init, inherited by the program), rounded to the nearest whole number and at least 1. The program sees only those CPUs. Plain pinning is a hint: the program may widen its own set. Forced pinning also denies `sched_setaffinity` (EPERM), which some programs use themselves (Wine's `SetThreadAffinityMask`). | `CpuMethod::Auto` (cgroup, else pinning: forced in strict mode, plain without), `Cgroup`, `Pin`, `PinForced` |
+| pids | Sizing the sandbox's PID namespace: init sets `pid_max` to `pids + 299` and `ns_last_pid` so pid numbers wrap (to 300) before the program starts; from then on exactly `pids - 1` tasks fit besides init, as with pids.max. Needs a per-namespace `pid_max` (Linux 6.14+); on older kernels strict mode refuses. | `PidsMethod::Auto` (cgroup, else the PID namespace), `Cgroup`, `PidNamespace` |
+| freeze | SIGSTOP and SIGCONT to every process from init. Nothing can escape it (children forked meanwhile are stopped too), but programs can tell: a SIGCONT handler runs on resume, and parents see their children stop and continue, which job-control shells react to. Forwarded SIGCONT and SIGTSTP are held back while paused. | `FreezeMethod::Auto` (cgroup freezer, else signals), `Cgroup`, `Signals` |
+
+`CpuChoice` picks the CPUs, within the ones the calling thread may run
+on: `Spread` (default) uses as many physical cores as possible, `Pack`
+as few as possible (all hyperthreads of a core first), both rotating
+from sandbox to sandbox (from a random start per process, so separate
+processes spread too); `List(cpus)` takes the first N of the given CPUs.
+
 ## Requirements and limits
 
 - Linux 6.x (`clone3`, `open_tree`/`move_mount`/`mount_setattr`,
   `openat2`, pidfds, Landlock), x86_64 or aarch64.
 - Unprivileged user namespaces. Ubuntu 24.04+ restricts them through
   AppArmor and needs a profile for the host binary.
-- For `Limits`: a systemd user manager and `busctl`, or a cgroup v2
-  directory you can write to (`Cgroup::Join`).
+- For a memory limit, a cgroup quota for cpus, pids.max or the cgroup
+  freezer: a systemd user manager and `busctl`, or a cgroup v2 directory
+  you can write to (`Cgroup::Join`). The fallbacks above need neither.
 - `Child::signal` forwards SIGHUP, INT, QUIT, USR1, USR2, ALRM, TERM, CONT,
   TSTP and WINCH. Pausing the whole sandbox needs `freeze`.
 - If your process forks without exec while a spawn is in flight, the
@@ -145,8 +172,10 @@ cargo test     # unit tests, plus end-to-end tests of every guarantee above
 ```
 
 The end-to-end tests need `sh`, `bash`, `python3` and `curl` on the host,
-and run sandboxes on many threads at once. The limit and freeze tests are
-skipped without a systemd user manager. They don't need internet access.
+and run sandboxes on many threads at once. The limit and freeze tests
+through a systemd scope are skipped without a systemd user manager; the
+fallback tests always run (the pids one is skipped on kernels without a
+per-namespace `pid_max`). They don't need internet access.
 
 ## License
 

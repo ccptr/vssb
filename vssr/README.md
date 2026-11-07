@@ -37,7 +37,9 @@ resolves.
 - Unprivileged user namespaces enabled (the default on most distributions;
   Ubuntu 24.04+ restricts them through AppArmor and needs a profile).
 - x86_64 or aarch64.
-- For memory/CPU/pid limits: `busctl` and a systemd user manager.
+- For a memory limit: `busctl` and a systemd user manager. Without one,
+  `cpus` pins the sandbox to that many CPUs and `pids` sizes its PID
+  namespace (Linux 6.14+) instead; see vssb's README for the details.
 
 The sandbox itself is built by [vssb](../vssb), the library crate next to
 vssr in this workspace. Build with `cargo build --release` from the
@@ -116,9 +118,12 @@ pass = ["PATH", "TERM", "LANG", "LC_*", "HOME", "ANTHROPIC_API_KEY"]
 set = { CI = "1" }
 
 [limits]
-memory = "8G"           # cgroup memory.max (swap disabled)
-cpus = 4                # cgroup cpu.max, in cores
-pids = 4096             # cgroup pids.max
+memory = "8G"           # cgroup memory.max (swap disabled); needs a cgroup
+cpus = 4                # cgroup cpu.max, in cores; without a cgroup, pinning
+pids = 4096             # cgroup pids.max; without a cgroup, the PID namespace's size
+cpu_method = "auto"     # auto (cgroup, else pinning: forced if strict), cgroup, pin, pin-forced
+cpu_choice = "spread"   # CPUs to pin to: spread, pack, or a list such as [0, 2]
+pids_method = "auto"    # auto (cgroup, else the PID namespace), cgroup, pid-namespace
 nofile = 8192           # RLIMIT_NOFILE
 fsize = "20G"           # RLIMIT_FSIZE
 
@@ -249,7 +254,9 @@ sandboxing:
    namespaces and writes its uid/gid maps. With limits, it asks the
    systemd user manager over D-Bus (`busctl`) for a transient scope
    (`vssb-<id>.scope`) holding the child, then the child enters a new
-   cgroup namespace rooted there;
+   cgroup namespace rooted there. Without a scope, init applies the
+   fallbacks instead (CPU pinning, the PID namespace's size), and the
+   audit `start` event's `limits` says which applied;
 2. the child, PID 1 of the new namespace, clones every bind source with
    `open_tree`, makes it read-only, nosuid and nodev while still
    detached, mounts a tmpfs as the new root, attaches everything under it

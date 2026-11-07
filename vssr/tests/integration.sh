@@ -270,6 +270,50 @@ else
     echo " --   skipped (no systemd user manager)"
 fi
 
+echo "== limits without systemd (fallbacks)"
+# vssr with the user bus hidden, so no systemd scope can be created.
+cat > "$WORK/nosd" <<EOF
+#!/bin/sh
+exec env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent "$V" "\$@"
+EOF
+chmod +x "$WORK/nosd"
+REAL_V=$V V=$WORK/nosd
+FORKS='import os, time
+kids = []
+while True:
+    try: pid = os.fork()
+    except OSError: break
+    if pid == 0: time.sleep(30); os._exit(0)
+    kids.append(pid)
+print("forks", len(kids))'
+AFFINITY='import os
+n = len(os.sched_getaffinity(0))
+try: os.sched_setaffinity(0, range(os.cpu_count())); w = "widened"
+except PermissionError: w = "denied"
+print(n, w)'
+if "$V" run --pids 10 -- python3 -c "$FORKS" 2>&1 | grep -q pid_max; then
+    echo " --   pids fallback skipped (no per-namespace pid_max)"
+else
+    expect_out "pids fallback: exact cap in the PID namespace" '^forks 8$' -- run --pids 10 -- python3 -c "$FORKS"
+fi
+expect     "memory limit refused without a cgroup (strict)"    125 -- run --memory 64M -- true
+expect_out "memory limit skipped with --no-strict, and said"   'memory limit is not in effect' -- run --no-strict --memory 64M -- true
+expect_out "cpus fallback pins, forced in strict mode"         '^1 denied$' -- run --cpus 1 -- python3 -c "$AFFINITY"
+expect_out "cpus fallback pins plainly with --no-strict"       '^1 widened$' -- run --no-strict --cpus 1 -- python3 -c "$AFFINITY"
+"$V" run --cpus 1 --pids 64 --audit-log "$WORK/limits.jsonl" -- true >/dev/null 2>&1
+grep '"event":"start"' "$WORK/limits.jsonl" | grep -q '"cpus":{"forced":true,"pinned":\[[0-9]*\]}' \
+    && grep '"event":"start"' "$WORK/limits.jsonl" | grep -Eq '"pids":"(pid-namespace|none)"' \
+    && ok "the start event says how limits apply" || bad "the start event says how limits apply" "$(cat "$WORK/limits.jsonl" 2>/dev/null)"
+V=$REAL_V
+cat > pin.toml <<EOF
+[fs]
+rw = ["\$PWD"]
+[limits]
+cpu_method = "pin"
+cpu_choice = [0]
+EOF
+expect_out "cpu_method = \"pin\" pins even with systemd"     '^1 widened$' -- run -p pin.toml --cpus 1 -- python3 -c "$AFFINITY"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
