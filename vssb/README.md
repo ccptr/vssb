@@ -147,3 +147,9 @@ cargo test     # unit tests, plus end-to-end tests of every guarantee above
 The end-to-end tests need `sh`, `bash`, `python3` and `curl` on the host,
 and run sandboxes on many threads at once. The limit and freeze tests are
 skipped without a systemd user manager. They don't need internet access.
+
+## License
+
+Mozilla Public License 2.0 ([`LICENSE`](../LICENSE)): you can link it into
+a program under any license, including a closed one, statically or not;
+changes to its own files stay under the MPL.

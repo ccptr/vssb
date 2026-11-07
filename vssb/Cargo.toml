@@ -2,6 +2,7 @@
 name = "vssb"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "Embeddable rootless Linux sandbox: namespaces, Landlock, seccomp and cgroup limits, safe to start from any thread"
 publish = false
 

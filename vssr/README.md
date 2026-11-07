@@ -280,3 +280,9 @@ tests/integration.sh        # end-to-end checks of the guarantees above
 The integration tests need internet access for the proxy tests
 (`VSSR_TEST_OFFLINE=1` skips them) and a systemd user manager for the
 limit tests.
+
+## License
+
+Mozilla Public License 2.0 ([`LICENSE`](../LICENSE)): changes to its files
+stay under the MPL; programs that only run it or use its parts in larger
+works can be under any license.
