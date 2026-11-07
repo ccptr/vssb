@@ -112,6 +112,87 @@ expect "noexec blocks binaries"        126 -- run -p noexec.toml -- ./mytrue
 expect "/dev/null works"               0   -- run -- sh -c 'echo x > /dev/null'
 expect "ptys work"                     0   -- run -- python3 -c 'import pty; pty.openpty()'
 
+echo "== attacks from another sandbox"
+# A plants a symlink in the project for a later run to follow.
+expect "a sandbox can plant a symlink in its project" 0 -- run -- ln -s "$WORK/host-secret" planted
+ln -s proj "$WORK/proj-alias"; mkdir -p "$WORK/elsewhere"
+out=$(cd "$WORK/elsewhere" && "$V" run --rw "$WORK/proj-alias" --ro "$WORK/proj/planted:/exposed" -- cat /exposed 2>/dev/null); code=$?
+[ $code = 125 ] && [ -z "$out" ] && ok "  ...which a later run, writing the project by another name, refuses" \
+    || bad "  ...which a later run, writing the project by another name, refuses" "exit $code: $out"
+rm -f planted
+# A runs in the same directory as B (both can write it, like two agents in
+# one project), plants symlinks to host paths it can't see and keeps
+# swapping them (renameat2 RENAME_EXCHANGE) with what B binds or logs to.
+R="$WORK/race"
+mkdir -p "$R/x" "$R/p/x" "$R/logs" "$WORK/race-secret/x" "$WORK/race-logs"
+echo real > "$R/x/f"; echo real > "$R/p/x/f"
+echo secret > "$WORK/race-secret/f"; echo secret > "$WORK/race-secret/x/f"
+echo keep > "$WORK/race-sentinel"; : > "$R/log.jsonl"
+cat > "$R/swap.py" <<'EOF'
+# swap.py NAME=TARGET...: plants NAME.swap -> TARGET for each, then swaps
+# NAME and NAME.swap over and over until ./stop appears.
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+names = []
+for a in sys.argv[1:]:
+    n, t = a.split("=", 1)
+    os.symlink(t, n + ".swap")
+    names.append(n.encode())
+print("swapping", flush=True)
+swaps = 0
+while not os.path.exists("stop"):
+    for n in names:
+        if libc.renameat2(-100, n, -100, n + b".swap", 2) != 0:
+            sys.exit("renameat2: " + os.strerror(ctypes.get_errno()))
+    swaps += 1
+print(swaps)
+EOF
+( cd "$R" && exec timeout 300 "$V" run -- python3 swap.py "x=$WORK/race-secret" "p=$WORK/race-secret" \
+    "log.jsonl=$WORK/race-sentinel" "logs=$WORK/race-logs" ) > "$WORK/race-a.out" 2>&1 &
+apid=$!
+for _ in $(seq 100); do grep -q swapping "$WORK/race-a.out" && break; sleep 0.1; done
+if grep -q swapping "$WORK/race-a.out"; then
+    # B binds R/x (swapped itself) and R/p/x (a directory above it swapped).
+    # vssr refuses a symlink it sees; vssb one swapped in after that.
+    real=0 policy=0 child=0 leaked=0 other=
+    for i in $(seq 400); do
+        out=$(cd "$R" && "$V" run --ro "$R/x:/mnt/x" --ro "$R/p/x:/mnt/y" -- cat /mnt/x/f /mnt/y/f 2>"$WORK/race-b.err"); code=$?
+        err=$(cat "$WORK/race-b.err")
+        if [[ $out == *secret* ]]; then leaked=$((leaked + 1))
+        elif [ $code = 0 ] && [ "$out" = "$(printf 'real\nreal')" ]; then real=$((real + 1))
+        elif [ $code = 125 ] && [[ $err == *"refusing to follow the symlink"* ]]; then policy=$((policy + 1))
+        elif [ $code = 125 ] && [[ $err == *"has a symlink in its path"* ]]; then child=$((child + 1))
+        else other="exit $code: $out $err"; fi
+        [ $real -gt 0 ] && [ $policy -gt 0 ] && [ $child -gt 0 ] && [ $i -ge 30 ] && break
+    done
+    counts="$real exposed, $policy refused by vssr, $child refused by vssb, $leaked leaked"
+    [ $leaked = 0 ] && [ -z "$other" ] && ok "binds can't be redirected by another sandbox ($counts)" \
+        || bad "binds can't be redirected by another sandbox" "$counts; $other"
+    [ $real -gt 0 ] && [ $policy -gt 0 ] && [ $child -gt 0 ] && ok "  ...which raced both checks" \
+        || bad "  ...which raced both checks" "$counts"
+    # B's audit log: the file swapped with a symlink to a host file, and a
+    # directory above it swapped with one to a host directory.
+    logged=0 refused=0 other=
+    for i in $(seq 400); do
+        for log in log.jsonl logs/a.jsonl; do
+            (cd "$R" && "$V" run --audit-log "$R/$log" -- true) >/dev/null 2>"$WORK/race-b.err"; code=$?
+            if [ $code = 0 ]; then logged=$((logged + 1))
+            elif [ $code = 125 ] && grep -Eq 'symlink|symbolic link' "$WORK/race-b.err"; then refused=$((refused + 1))
+            else other="$log: exit $code: $(cat "$WORK/race-b.err")"; fi
+        done
+        [ $logged -gt 0 ] && [ $refused -gt 0 ] && [ $i -ge 15 ] && break
+    done
+    counts="$logged logged, $refused refused"
+    [ "$(cat "$WORK/race-sentinel")" = keep ] && [ -z "$(ls -A "$WORK/race-logs")" ] && [ -z "$other" ] \
+        && ok "the audit log can't be redirected by another sandbox ($counts)" \
+        || bad "the audit log can't be redirected by another sandbox" "$counts; $other; $(ls -A "$WORK/race-logs")"
+    [ $logged -gt 0 ] && [ $refused -gt 0 ] && ok "  ...which raced its checks" || bad "  ...which raced its checks" "$counts"
+fi
+touch "$R/stop"; wait $apid; acode=$?
+swaps=$(tail -n 1 "$WORK/race-a.out")
+[ $acode = 0 ] && [[ $swaps =~ ^[0-9]+$ ]] && [ "$swaps" -gt 0 ] && ok "the attacking sandbox kept swapping ($swaps rounds)" \
+    || bad "the attacking sandbox kept swapping" "exit $acode: $(cat "$WORK/race-a.out")"
+
 echo "== detection (cargo)"
 # ws/app depends on ../lib (which depends on ../lib2), on a member of the
 # workspace ws/other, and on ../../outside, which is outside detect.within;

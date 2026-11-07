@@ -272,6 +272,148 @@ fn symlinks_are_never_created_in_host_directories() {
     assert_eq!(std::fs::read_dir(d.0.join("t")).unwrap().count(), 0);
 }
 
+// == races: a bind source swapped for a symlink while a sandbox starts
+
+/// Swaps two directory entries atomically (renameat2 RENAME_EXCHANGE).
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let (a, b) = (std::ffi::CString::new(a.as_os_str().as_bytes()).unwrap(), std::ffi::CString::new(b.as_os_str().as_bytes()).unwrap());
+    let r = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) };
+    if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// `d/x/f` and `d/p/x/f` hold "real"; `secret/f` and `secret/x/f` hold
+/// "secret". The attacker swaps `d/x` (the source itself) and `d/p` (a
+/// directory above it) with symlinks to `secret`.
+fn race_fixture(d: &Dir, secret: &Dir) {
+    for p in ["x", "p/x"] {
+        std::fs::create_dir_all(d.0.join(p)).unwrap();
+        std::fs::write(d.0.join(p).join("f"), "real").unwrap();
+    }
+    std::fs::create_dir(secret.0.join("x")).unwrap();
+    std::fs::write(secret.0.join("f"), "secret").unwrap();
+    std::fs::write(secret.0.join("x/f"), "secret").unwrap();
+}
+
+/// What sandboxes binding a source under attack saw.
+#[derive(Default, Debug)]
+struct Race {
+    real: usize,
+    refused: usize,
+    secret: usize,
+    other: Vec<String>,
+}
+
+/// Spawns sandboxes that bind `src` read-only and read `f` from it, until
+/// `done` or a time limit.
+fn race_bind(src: &Path, no_symlinks: bool, done: impl Fn(&Race) -> bool) -> Race {
+    let mut r = Race::default();
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end && !done(&r) {
+        let m = Mount::ro_at(src, "/mnt/x");
+        let mut sb = Sandbox::new();
+        sb.system(true).mount(if no_symlinks { m.no_symlinks() } else { m });
+        let mut c = Command::new("cat");
+        c.args(["/mnt/x/f"]).cwd("/").env("PATH", "/usr/bin:/bin").stdout(Stdio::Piped).stderr(Stdio::Piped);
+        match sb.spawn(c) {
+            Ok(mut child) => {
+                let mut out = String::new();
+                child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+                let s = child.wait().unwrap();
+                match out.as_str() {
+                    "real" if s.success() => r.real += 1,
+                    "secret" => r.secret += 1,
+                    _ => r.other.push(format!("{s}: {out:?}")),
+                }
+            }
+            Err(e) if e.to_string().contains("has a symlink in its path") => r.refused += 1,
+            Err(e) => r.other.push(e.to_string()),
+        }
+    }
+    r
+}
+
+/// Both outcomes seen, so the attacker really raced the sandbox.
+fn raced(r: &Race) -> bool {
+    r.real > 0 && r.refused > 0 && r.real + r.refused >= 20
+}
+
+#[test]
+fn bind_sources_swapped_for_symlinks_are_refused() {
+    let (d, secret) = (Dir::new(), Dir::new());
+    race_fixture(&d, &secret);
+    let pairs: Vec<(PathBuf, PathBuf)> = ["x", "p"].iter().map(|n| (d.0.join(n), d.0.join(format!("{n}.swap")))).collect();
+    for (_, swap) in &pairs {
+        std::os::unix::fs::symlink(&secret.0, swap).unwrap();
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let (pairs, stop) = (pairs.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for (a, b) in &pairs {
+                    exchange(a, b).unwrap();
+                }
+            }
+        })
+    };
+    for src in [d.0.join("x"), d.0.join("p/x")] {
+        // Taken as given (as vssr does after checking it): a symlink is
+        // refused whenever the child meets it, never followed.
+        let r = race_bind(&src, true, raced);
+        assert!(r.secret == 0 && r.other.is_empty() && raced(&r), "no_symlinks, {}: {r:?}", src.display());
+        // Resolved by vssb: following the symlink while resolving is how a
+        // plain source works, but one swapped in after that is refused.
+        let r = race_bind(&src, false, |r| r.refused > 0 && r.real > 0);
+        assert!(r.other.is_empty() && r.refused > 0 && r.real > 0, "resolved, {}: {r:?}", src.display());
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+}
+
+/// A sandbox that can write the directory another one binds from plants
+/// symlinks to a host directory it can't see, and keeps swapping them in.
+#[test]
+fn a_sandbox_cant_redirect_another_sandboxs_binds() {
+    let (d, secret) = (Dir::new(), Dir::new());
+    race_fixture(&d, &secret);
+    let attacker = r#"
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+for n in ("x", "p"):
+    os.symlink(sys.argv[1], n + ".swap")
+print("swapping", flush=True)
+swaps = 0
+while not os.path.exists("stop"):
+    for n in (b"x", b"p"):
+        if libc.renameat2(-100, n, -100, n + b".swap", 2) != 0:
+            sys.exit("renameat2: " + os.strerror(ctypes.get_errno()))
+    swaps += 1
+print(swaps)
+"#;
+    let mut c = python(&d, attacker);
+    c.args([secret.0.as_os_str()]);
+    let mut a = sandbox(&d).spawn(c).expect("spawn the attacker");
+    let mut a_out = std::io::BufReader::new(a.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut a_out, &mut line).unwrap();
+    if line != "swapping\n" {
+        let mut err = String::new();
+        a.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        panic!("attacker: {line:?} {err}");
+    }
+    let results: Vec<_> = [d.0.join("x"), d.0.join("p/x")].into_iter().map(|src| (race_bind(&src, true, raced), src)).collect();
+    std::fs::write(d.0.join("stop"), "").unwrap();
+    let mut rest = String::new();
+    a_out.read_to_string(&mut rest).unwrap();
+    let s = a.wait().unwrap();
+    assert!(s.success() && rest.trim().parse::<u64>().is_ok_and(|n| n > 0), "attacker: {s}: {rest:?}");
+    for (r, src) in results {
+        assert!(r.secret == 0 && r.other.is_empty() && raced(&r), "{}: {r:?}", src.display());
+    }
+    assert_eq!(std::fs::read_to_string(secret.0.join("f")).unwrap(), "secret");
+}
+
 #[test]
 fn missing_sources_are_config_errors() {
     let d = Dir::new();
