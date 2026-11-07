@@ -57,7 +57,7 @@ are the guarantees towards the host, each with an integration test in
   for the moment of clone), and no re-execution of the host. Limits come
   from asking the systemd user manager over D-Bus (`busctl`) to move the
   waiting child into a new scope, rather than re-running the host under
-  `systemd-run` as vssr does.
+  `systemd-run`.
 - **Your `waitpid(-1)` can't steal it.** The sandbox is a "clone child"
   (no exit signal): it sends no SIGCHLD and only `__WALL` waits see it.
   `Child` waits on its pidfd, which can also go into your poll loop or
@@ -114,12 +114,13 @@ are the guarantees towards the host, each with an integration test in
   through a callback and stops cleanly. It is the only part that starts
   threads.
 
-## Not here (they stay in vssr)
+## Not here (they are in vssr)
 
 Policy files, path expansion (`~`, `$PWD`), Cargo dependency detection, the
-audit log format and the CLI are front-end concerns. vssr can be rebuilt
-on top of this crate: its `Plan` maps onto `Sandbox` + `Command`, and its
-`proxy` and `audit` onto `proxy::serve` with an event callback.
+audit log format and the CLI are front-end concerns, and live in
+[vssr](../vssr), which is built on this crate: it maps its `Plan` onto
+`Sandbox` + `Command`, and serves `proxy::serve` with a callback that
+writes the events to its audit log.
 
 ## Requirements and limits
 
