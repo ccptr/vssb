@@ -4,7 +4,9 @@ The sandbox core of [vssr](../vssr) as a library you can embed: run a
 program in a rootless Linux sandbox (namespaces, Landlock, seccomp, cgroup
 limits) from inside another program, such as a game launcher, an agent
 harness or a build tool. It needs no root, no daemon and no helper binary.
-Its only dependency is `libc`.
+Its dependencies are `libc` and `ossteam-dbus`, a blocking D-Bus client
+it uses to ask the systemd user manager for a scope (from the ossteam
+repository, checked out next to this one).
 
 ```rust
 use vssb::{Command, Limits, Mount, Sandbox, Stdio};
