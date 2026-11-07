@@ -1,0 +1,60 @@
+# Claude Code running unattended on the current repository.
+#
+#   mkdir -p ~/.local/share/vssr/claude      # once: sandbox-only Claude state
+#   cd ~/p/some-repo
+#   vssr run -p claude-code.toml -- claude -p "fix the failing tests" --dangerously-skip-permissions
+#
+# Authentication: pass ANTHROPIC_API_KEY, or log in once inside the sandbox
+# (vssr run -p claude-code.toml --tty -- claude) so the token is stored in
+# the sandbox-only state directory, never in your real ~/.claude.
+
+command = ["claude"]
+
+[sandbox]
+timeout = "2h"
+
+[fs]
+tmpfs = ["~"]
+rw = [
+  "$PWD",
+  # Your real ~/.claude holds settings, hooks and plugins that run outside
+  # the sandbox, so the agent gets its own copy of that directory instead.
+  "~/.local/share/vssr/claude:~/.claude",
+]
+ro = ["?~/.gitconfig"]
+deny = ["$PWD/.env", "$PWD/.env.local"]
+
+[detect]
+# Path dependencies outside the repository (say ../shared-crate) are
+# exposed read-only when they're under one of these.
+# within = ["~/p"]
+# Dependencies elsewhere in this git repository are read-only by default;
+# make them writable too:
+# project = "rw"
+
+[net]
+mode = "proxy"
+allow = [
+  "api.anthropic.com",
+  "github.com", "codeload.github.com", "*.githubusercontent.com",
+  "registry.npmjs.org",
+  "pypi.org", "files.pythonhosted.org",
+  "index.crates.io", "static.crates.io",
+]
+
+[env]
+pass = ["PATH", "TERM", "COLORTERM", "LANG", "LC_*", "TZ", "USER", "LOGNAME", "HOME", "ANTHROPIC_API_KEY"]
+
+[env.set]
+CLAUDE_CONFIG_DIR = "~/.claude"
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+DISABLE_AUTOUPDATER = "1"
+
+[limits]
+memory = "8G"
+cpus = 4
+pids = 4096
+nofile = 8192
+
+[audit]
+log = "~/.local/state/vssr/audit.jsonl"

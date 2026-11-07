@@ -1,3 +1,3 @@
 [workspace]
-members = ["vssb"]
+members = ["vssb", "vssr"]
 resolver = "3"

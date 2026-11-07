@@ -1,0 +1,26 @@
+# Build or test code you don't trust: the source is read-only, only the
+# build output directory is writable, and there is no network at all.
+#
+#   cd ~/p/some-repo && mkdir -p build
+#   vssr run -p untrusted-build.toml -- make -C build
+
+[sandbox]
+timeout = "30m"
+
+[fs]
+tmpfs = ["~"]
+ro = ["$PWD"]
+rw = ["$PWD/build"]
+noexec = ["/tmp"]
+
+[net]
+mode = "none"
+
+[limits]
+memory = "4G"
+cpus = 2
+pids = 1024
+fsize = "4G"
+
+[seccomp]
+deny = ["kcmp", "personality"]
