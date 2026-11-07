@@ -1,7 +1,7 @@
 //! Audit log: one JSON object per line, appended to a file. Every event
 //! carries the sandbox id so concurrent runs can share one log.
 
-use crate::util::resolve_guarded;
+use crate::util::resolve_guarded_prefix;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use std::ffi::CString;
@@ -50,27 +50,53 @@ fn os_err(what: &str) -> anyhow::Error {
     anyhow::Error::new(std::io::Error::last_os_error()).context(what.to_string())
 }
 
-fn open_log(p: &Path, writable: &[PathBuf]) -> Result<File> {
-    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { bail!("not a file path") };
-    // Resolve the directory first, so missing parts aren't created through
-    // a planted symlink.
-    let dir = match resolve_guarded(parent, writable)? {
-        Some(d) => d,
-        None => {
-            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-            resolve_guarded(parent, writable)?.with_context(|| format!("{} disappeared", parent.display()))?
-        }
-    };
-    // Pin the checked directory: a symlink swapped in since is an error.
-    let cdir = CString::new(dir.as_os_str().as_bytes())?;
+/// openat2 with RESOLVE_NO_SYMLINKS, for a directory.
+fn open_dir(dirfd: libc::c_int, path: &[u8]) -> std::io::Result<OwnedFd> {
+    let c = CString::new(path)?;
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
     how.resolve = libc::RESOLVE_NO_SYMLINKS;
-    let fd = unsafe { libc::syscall(libc::SYS_openat2, libc::AT_FDCWD, cdir.as_ptr(), &how as *const libc::open_how, std::mem::size_of::<libc::open_how>()) };
+    let fd = unsafe { libc::syscall(libc::SYS_openat2, dirfd, c.as_ptr(), &how as *const libc::open_how, std::mem::size_of::<libc::open_how>()) };
     if fd < 0 {
-        return Err(os_err(&format!("opening {}", dir.display())));
+        return Err(std::io::Error::last_os_error());
     }
-    let dfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Opens the log's directory, creating what is missing. The part that
+/// exists is resolved with `resolve_guarded` and pinned; each missing
+/// component is then made with `mkdirat` and opened from its parent's
+/// descriptor without following a symlink, so a symlink planted on the
+/// way (by the sandbox, before or during this) is an error, never a
+/// place where directories get created.
+fn log_dir(parent: &Path, writable: &[PathBuf]) -> Result<OwnedFd> {
+    let (dir, missing) = resolve_guarded_prefix(parent, writable)?;
+    if let Some(i) = missing.iter().position(|c| c == "..") {
+        bail!("{}: \"..\" after the missing directory {}", parent.display(), dir.join(missing[0..i].iter().collect::<PathBuf>()).display());
+    }
+    // Pin the checked directory: a symlink swapped in since is an error.
+    let mut dfd = open_dir(libc::AT_FDCWD, dir.as_os_str().as_bytes()).with_context(|| format!("opening {}", dir.display()))?;
+    let mut at = dir;
+    for c in missing {
+        at.push(&c);
+        let cname = CString::new(c.as_bytes())?;
+        if unsafe { libc::mkdirat(dfd.as_raw_fd(), cname.as_ptr(), 0o777) } < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+            return Err(os_err(&format!("creating {}", at.display())));
+        }
+        dfd = match open_dir(dfd.as_raw_fd(), c.as_bytes()) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                bail!("{}: refusing to follow the symlink {} (the sandbox may have planted it)", parent.display(), at.display())
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {}", at.display()))),
+        };
+    }
+    Ok(dfd)
+}
+
+fn open_log(p: &Path, writable: &[PathBuf]) -> Result<File> {
+    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { bail!("not a file path") };
+    let dfd = log_dir(parent, writable)?;
     // O_NOFOLLOW: no symlink as the log; O_NONBLOCK: a FIFO doesn't block the open.
     let cname = CString::new(name.as_bytes())?;
     let flags = libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -148,6 +174,71 @@ mod tests {
         assert!(reader >= 0);
         assert!(open_err(&fifo, &w).contains("not a regular file"));
         unsafe { libc::close(reader) };
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn creates_directories_without_following_symlinks() {
+        let b = base("mkdir");
+        let w = [b.join("proj")];
+        std::fs::create_dir(b.join("outside")).unwrap();
+        std::os::unix::fs::symlink(b.join("outside"), b.join("proj/logs")).unwrap();
+        // A missing directory, then "..", then the symlink: refused before
+        // anything is created.
+        let e = open_err(&b.join("proj/missing/../logs/created/a.jsonl"), &w);
+        assert!(e.contains("after the missing directory"), "{e}");
+        assert!(!b.join("proj/missing").exists());
+        // Missing directories are created, and the log in them.
+        let log = b.join("proj/new/deeper/a.jsonl");
+        Audit::open(Some(&log), &w, "t".into(), false).unwrap().event("x", json!({}));
+        assert!(std::fs::read_to_string(&log).unwrap().contains(r#""event":"x""#));
+        assert!(std::fs::read_dir(b.join("outside")).unwrap().next().is_none());
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn creating_directories_races_a_planted_symlink() {
+        // A thread keeps planting and removing proj/logs -> outside while
+        // the log is opened in proj/logs/new: refused or created in the
+        // project, never in outside. Both outcomes are required, so the
+        // race really ran.
+        let b = base("race");
+        let w = [b.join("proj")];
+        let (outside, logs) = (b.join("outside"), b.join("proj/logs"));
+        std::fs::create_dir(&outside).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let planter = {
+            let (stop, outside, logs) = (stop.clone(), outside.clone(), logs.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::os::unix::fs::symlink(&outside, &logs).is_ok() {
+                        let _ = std::fs::remove_file(&logs);
+                    }
+                }
+            })
+        };
+        let (mut created, mut refused) = (0, 0);
+        for i in 0..20000 {
+            match Audit::open(Some(&logs.join("new/a.jsonl")), &w, "t".into(), false) {
+                Ok(_) => {
+                    created += 1;
+                    // The real directory; the planter can't remove it.
+                    std::fs::remove_dir_all(&logs).unwrap();
+                }
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    assert!(e.contains("symlink") || e.contains("No such file"), "{e}");
+                    refused += 1;
+                }
+            }
+            assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "created outside after {i} rounds");
+            if created > 20 && refused > 20 && i > 200 {
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        planter.join().unwrap();
+        assert!(created > 0 && refused > 0, "{created} created, {refused} refused");
         std::fs::remove_dir_all(&b).unwrap();
     }
 }

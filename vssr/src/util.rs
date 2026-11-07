@@ -120,6 +120,14 @@ pub fn normalize(p: &Path) -> Result<PathBuf> {
 /// Symlinks elsewhere, above a writable directory too, are followed.
 /// Returns the canonical path, or None when a component is missing.
 pub fn resolve_guarded(p: &Path, writable: &[PathBuf]) -> Result<Option<PathBuf>> {
+    let (out, missing) = resolve_guarded_prefix(p, writable)?;
+    Ok(missing.is_empty().then_some(out))
+}
+
+/// `resolve_guarded` up to the first missing component: returns the
+/// canonical part that exists and the components still to resolve from
+/// it, in order (none when the whole path exists).
+pub fn resolve_guarded_prefix(p: &Path, writable: &[PathBuf]) -> Result<(PathBuf, Vec<OsString>)> {
     if !p.is_absolute() {
         bail!("{}: not an absolute path", p.display());
     }
@@ -145,7 +153,11 @@ pub fn resolve_guarded(p: &Path, writable: &[PathBuf]) -> Result<Option<PathBuf>
         let next = out.join(&c);
         let meta = match std::fs::symlink_metadata(&next) {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                rest.push(c);
+                rest.reverse();
+                return Ok((out, rest));
+            }
             Err(e) => return Err(e).with_context(|| format!("{}: {}", p.display(), next.display())),
         };
         if !meta.file_type().is_symlink() {
@@ -165,7 +177,7 @@ pub fn resolve_guarded(p: &Path, writable: &[PathBuf]) -> Result<Option<PathBuf>
         }
         push(&mut rest, &target);
     }
-    Ok(Some(out))
+    Ok((out, Vec::new()))
 }
 
 pub fn random_id() -> String {

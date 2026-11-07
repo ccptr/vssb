@@ -45,7 +45,8 @@ into a `vssb::Sandbox` and `vssb::Command`.
   planted after the check is an error, not a new destination.
 - The audit log is opened without following a symlink the sandbox could
   have planted (`resolve_guarded` on its directory, then `openat2` and
-  `O_NOFOLLOW`), and only as a regular file.
+  `O_NOFOLLOW`), and only as a regular file. Missing directories on the
+  way are made with `mkdirat` from the pinned parent, never by path.
 - The forwarded signals are blocked before the sandbox or any proxy
   thread starts, so only the signalfd receives them.
 - vssb's own invariants (fork safety of the child, mount-point lookup,

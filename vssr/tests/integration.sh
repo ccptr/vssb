@@ -42,6 +42,8 @@ expect "a symlinked audit log is refused" 125 -- run --audit-log audit.jsonl -- 
 mkdir -p "$WORK/audit-dir"; ln -s "$WORK/audit-dir" logs
 expect "  ...and so is a symlinked directory in a writable one" 125 -- run --audit-log logs/a.jsonl -- true
 [ -z "$(ls -A "$WORK/audit-dir")" ] && ok "  ...which stays empty" || bad "  ...which stays empty"
+expect "  ...also reached through a missing directory and \"..\"" 125 -- run --audit-log missing/../logs/created/a.jsonl -- true
+[ -z "$(ls -A "$WORK/audit-dir")" ] && [ ! -e missing ] && ok "  ...which creates nothing" || bad "  ...which creates nothing" "$(ls -A "$WORK/audit-dir") $(ls -d missing 2>/dev/null)"
 mkfifo audit.fifo
 timeout 10 "$V" run --audit-log audit.fifo -- true >/dev/null 2>&1; [ $? = 125 ] && ok "a FIFO as the audit log is refused, without hanging" || bad "a FIFO as the audit log is refused, without hanging"
 rm -f audit.jsonl logs audit.fifo
@@ -171,10 +173,11 @@ if grep -q swapping "$WORK/race-a.out"; then
     [ $real -gt 0 ] && [ $policy -gt 0 ] && [ $child -gt 0 ] && ok "  ...which raced both checks" \
         || bad "  ...which raced both checks" "$counts"
     # B's audit log: the file swapped with a symlink to a host file, and a
-    # directory above it swapped with one to a host directory.
+    # directory above it swapped with one to a host directory, also while
+    # B creates a directory in it.
     logged=0 refused=0 other=
     for i in $(seq 400); do
-        for log in log.jsonl logs/a.jsonl; do
+        for log in log.jsonl logs/a.jsonl "logs/new$i/a.jsonl"; do
             (cd "$R" && "$V" run --audit-log "$R/$log" -- true) >/dev/null 2>"$WORK/race-b.err"; code=$?
             if [ $code = 0 ]; then logged=$((logged + 1))
             elif [ $code = 125 ] && grep -Eq 'symlink|symbolic link' "$WORK/race-b.err"; then refused=$((refused + 1))
