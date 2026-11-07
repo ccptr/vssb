@@ -34,6 +34,47 @@ let status = sb.spawn(cmd)?.wait()?;
 Each crate's README covers its design, guarantees and security notes in
 full.
 
+## Conveniences in vssr
+
+- **Works without a policy file.** The built-in policy makes the current
+  directory writable, replaces `~` with an empty tmpfs, gives a read-only
+  system view and no network. `vssr policy` prints it with comments, as a
+  starting point for your own.
+- **Detects build dependencies.** At start, vssr reads the project's
+  `Cargo.toml` files and finds the directories the build will read outside
+  the working directory: path dependencies (transitive ones too),
+  `[patch]` and `[replace]` paths, workspace members and the workspace
+  roots of dependencies. Ones elsewhere in the same git repository are
+  exposed read-only on their own. Ones outside it are exposed only under
+  directories you list (`--detect-within ~/p`). Anything left out is
+  reported along with the option that would allow it. Run from a workspace
+  member, vssr says to run from the workspace root instead, since cargo
+  writes `Cargo.lock` and `target/` there.
+- **Shows its work.** `--dry-run` prints the resolved plan, with the
+  reason for each detected mount. `vssr check` adds what the kernel
+  supports. Both take `--json`.
+- **Proxy settings that clients pick up.** With `--allow HOST`, the
+  sandbox gets `HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY` and
+  `NODE_USE_ENV_PROXY=1`. curl, git, pip, npm, cargo, Python `requests`
+  and Node's `fetch` then go through the filtering proxy with no setup.
+  Patterns like `*.github.com` and `host:port` work.
+- **Paths as you'd write them.** `~`, `$VAR` and `$PWD` are expanded.
+  `SRC:DEST` mounts a path elsewhere, and a `?` prefix makes it optional.
+  Entries nest in any combination: a read-only `.git` or a hidden `.env`
+  inside a writable checkout. Host symlinks such as `/bin -> usr/bin` are
+  recreated as symlinks.
+- **Behaves like the command.** The exit status is the program's own (or
+  128+N for signal N), with the shell's 124–127 for timeout, setup
+  failure, not executable and not found. Signals are passed on, `--tty`
+  keeps the terminal for interactive tools, and `--timeout` sends
+  SIGTERM, then SIGKILL after a grace period. Startup takes about 10 ms.
+- **Easy to drive from another program.** `--audit-fd` streams JSON
+  events (a `start` event once the program runs, then connections,
+  signals and `exit`) to a descriptor you pass in. `-p /proc/self/fd/N`
+  reads the policy from a pipe, `--pass-fd` hands the program a
+  descriptor such as a pre-connected socket, and `--cgroup` uses a cgroup
+  you prepared.
+
 ## Requirements
 
 - Linux 6.x on x86_64 or aarch64, with unprivileged user namespaces
