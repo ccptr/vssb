@@ -195,6 +195,58 @@ touch "$R/stop"; wait $apid; acode=$?
 swaps=$(tail -n 1 "$WORK/race-a.out")
 [ $acode = 0 ] && [[ $swaps =~ ^[0-9]+$ ]] && [ "$swaps" -gt 0 ] && ok "the attacking sandbox kept swapping ($swaps rounds)" \
     || bad "the attacking sandbox kept swapping" "exit $acode: $(cat "$WORK/race-a.out")"
+# A keeps planting and removing logs -> a host directory while B logs to
+# logs/new/a.jsonl, so logs is often missing when vssr checks the path and
+# a symlink by the time it creates the directory.
+R2="$WORK/race2"
+mkdir -p "$R2" "$WORK/race2-outside"
+cat > "$R2/plant.py" <<'EOF'
+# plant.py NAME TARGET: creates and removes NAME -> TARGET over and over
+# until ./stop appears.
+import os, sys
+name, target = sys.argv[1:]
+print("planting", flush=True)
+planted = 0
+while not os.path.exists("stop"):
+    try:
+        os.symlink(target, name)
+    except FileExistsError:
+        continue  # B's real directory, until the test removes it
+    planted += 1
+    try:
+        os.unlink(name)
+    except OSError:
+        pass
+print(planted)
+EOF
+( cd "$R2" && exec timeout 300 "$V" run -- python3 plant.py logs "$WORK/race2-outside" ) > "$WORK/race2-a.out" 2>&1 &
+apid=$!
+for _ in $(seq 100); do grep -q planting "$WORK/race2-a.out" && break; sleep 0.1; done
+if grep -q planting "$WORK/race2-a.out"; then
+    logged=0 seen=0 during=0 other=
+    for i in $(seq 400); do
+        (cd "$R2" && "$V" run --audit-log "$R2/logs/new/a.jsonl" -- true) >/dev/null 2>"$WORK/race-b.err"; code=$?
+        err=$(cat "$WORK/race-b.err")
+        if [ $code = 0 ]; then
+            logged=$((logged + 1))
+            rm -rf "$R2/logs" # B's real directory: start again with it missing
+        elif [ $code = 125 ] && [[ $err == *"inside the writable directory"* ]]; then seen=$((seen + 1))
+        elif [ $code = 125 ] && [[ $err == *"may have planted it"* || $err == *"No such file"* ]]; then during=$((during + 1))
+        else other="exit $code: $err"; fi
+        [ -n "$(ls -A "$WORK/race2-outside")" ] && break
+        [ $logged -gt 0 ] && [ $seen -gt 0 ] && [ $during -gt 0 ] && [ $i -ge 30 ] && break
+    done
+    counts="$logged logged, $seen refused when checked, $during refused while creating"
+    [ -z "$(ls -A "$WORK/race2-outside")" ] && [ -z "$other" ] \
+        && ok "a symlink planted at a missing log directory isn't followed ($counts)" \
+        || bad "a symlink planted at a missing log directory isn't followed" "$counts; $other; created: $(ls -A "$WORK/race2-outside")"
+    [ $logged -gt 0 ] && [ $seen -gt 0 ] && [ $during -gt 0 ] && ok "  ...which raced the check and the creation" \
+        || bad "  ...which raced the check and the creation" "$counts"
+fi
+touch "$R2/stop"; wait $apid; acode=$?
+planted=$(tail -n 1 "$WORK/race2-a.out")
+[ $acode = 0 ] && [[ $planted =~ ^[0-9]+$ ]] && [ "$planted" -gt 0 ] && ok "the planting sandbox kept planting ($planted symlinks)" \
+    || bad "the planting sandbox kept planting" "exit $acode: $(cat "$WORK/race2-a.out")"
 
 echo "== detection (cargo)"
 # ws/app depends on ../lib (which depends on ../lib2), on a member of the
