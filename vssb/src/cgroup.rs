@@ -1,14 +1,35 @@
 //! cgroup placement. An unprivileged process can't move another process
 //! into a cgroup it may configure, but the systemd user manager can: after
-//! clone, while the child waits, vssb asks it over D-Bus (with `busctl`)
-//! for a transient scope holding the child, with the limits as properties.
-//! The child then makes that scope the root of its cgroup namespace.
+//! clone, while the child waits, vssb asks it over D-Bus (a blocking call
+//! on the caller's thread, no subprocess) for a transient scope holding the
+//! child, with the limits as properties. The child then makes that scope
+//! the root of its cgroup namespace.
 
 use crate::config::Limits;
+use ossteam_dbus::{Connection, Message, Type, Value};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// How long the bus and the systemd user manager get to answer.
+const BUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+const SYSTEMD: &str = "org.freedesktop.systemd1";
+const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
+
+/// A connection to the user bus (the session bus under systemd), with
+/// reads and writes that give up after [`BUS_TIMEOUT`].
+pub(crate) fn user_bus() -> Result<Connection, String> {
+    let s = ossteam_dbus::session_bus_socket().map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(BUS_TIMEOUT)).and_then(|_| s.set_write_timeout(Some(BUS_TIMEOUT))).map_err(|e| e.to_string())?;
+    Connection::on(s).map_err(|e| e.to_string())
+}
+
+/// Whether a systemd user manager answers on the user bus.
+pub(crate) fn systemd_answers() -> bool {
+    let ping = Message::call(SYSTEMD, SYSTEMD_PATH, "org.freedesktop.DBus.Peer", "Ping", vec![]);
+    user_bus().is_ok_and(|mut c| c.call(ping).is_ok())
+}
 
 /// cpu.max for `cpus` CPUs: (quota, period) in microseconds.
 fn cpu_quota(cpus: f64) -> (u64, u64) {
@@ -68,6 +89,36 @@ pub(crate) fn in_effect(dir: &Path, l: &Limits) -> InEffect {
     }
 }
 
+/// `StartTransientUnit(unit, "fail", properties, [])` for a scope holding
+/// `pid`, with the limits as properties.
+fn start_scope(pid: i32, unit: &str, l: &Limits) -> Message {
+    let prop = |name: &str, v: Value| Value::Struct(vec![Value::Str(name.into()), Value::Variant(Box::new(v))]);
+    let mut props = vec![
+        prop("PIDs", Value::Array(Type::U32, vec![Value::U32(pid as u32)])),
+        prop("Description", Value::Str("vssb sandbox".into())),
+        prop("CollectMode", Value::Str("inactive-or-failed".into())),
+    ];
+    if let Some(m) = l.memory {
+        props.push(prop("MemoryMax", Value::U64(m)));
+        props.push(prop("MemorySwapMax", Value::U64(0)));
+    }
+    if let Some(c) = l.cpus {
+        props.push(prop("CPUQuotaPerSecUSec", Value::U64(((c * 1e6).round() as u64).max(10_000))));
+    }
+    if let Some(p) = l.pids {
+        props.push(prop("TasksMax", Value::U64(p)));
+    }
+    let property = Type::Struct(vec![Type::Str, Type::Variant]);
+    let aux = Type::Struct(vec![Type::Str, Type::Array(Box::new(property.clone()))]);
+    Message::call(
+        SYSTEMD,
+        SYSTEMD_PATH,
+        "org.freedesktop.systemd1.Manager",
+        "StartTransientUnit",
+        vec![Value::Str(unit.into()), Value::Str("fail".into()), Value::Array(property, props), Value::Array(aux, vec![])],
+    )
+}
+
 fn cgroup_of(pid: i32) -> Option<String> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     s.lines().find_map(|l| l.strip_prefix("0::")).map(str::to_string)
@@ -77,43 +128,9 @@ fn cgroup_of(pid: i32) -> Option<String> {
 /// Returns its cgroup directory, or why that failed. Which limits took
 /// is checked afterwards with [`in_effect`].
 pub(crate) fn enter_scope(pid: i32, unit: &str, l: &Limits) -> Result<PathBuf, String> {
-    let mut props: Vec<String> = Vec::new();
-    let mut count = 0;
-    let mut prop = |p: &[&str]| {
-        props.extend(p.iter().map(|s| s.to_string()));
-        count += 1;
-    };
-    let pid_s = pid.to_string();
-    prop(&["PIDs", "au", "1", &pid_s]);
-    prop(&["Description", "s", "vssb sandbox"]);
-    prop(&["CollectMode", "s", "inactive-or-failed"]);
-    if let Some(m) = l.memory {
-        prop(&["MemoryMax", "t", &m.to_string()]);
-        prop(&["MemorySwapMax", "t", "0"]);
-    }
-    if let Some(c) = l.cpus {
-        let usec = ((c * 1e6).round() as u64).max(10_000);
-        prop(&["CPUQuotaPerSecUSec", "t", &usec.to_string()]);
-    }
-    if let Some(p) = l.pids {
-        prop(&["TasksMax", "t", &p.to_string()]);
-    }
-    let out = Command::new("busctl")
-        .args(["--user", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager"])
-        .args(["StartTransientUnit", "ssa(sv)a(sa(sv))", unit, "fail", &count.to_string()])
-        .args(&props)
-        .arg("0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
-    match out {
-        Err(e) => return Err(format!("running busctl to create a systemd user scope: {e}")),
-        Ok(o) if !o.status.success() => {
-            return Err(format!("creating systemd user scope {unit}: {}", String::from_utf8_lossy(&o.stderr).trim()));
-        }
-        Ok(_) => {}
-    }
+    let mut bus = user_bus().map_err(|e| format!("reaching the systemd user manager: {e}"))?;
+    bus.call(start_scope(pid, unit, l)).map_err(|e| format!("creating systemd user scope {unit}: {e}"))?;
+    drop(bus);
     // The job runs asynchronously: wait until the process is in the scope.
     let deadline = Instant::now() + Duration::from_secs(5);
     let suffix = format!("/{unit}");
@@ -134,6 +151,53 @@ pub(crate) fn enter_scope(pid: i32, unit: &str, l: &Limits) -> Result<PathBuf, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property `name` of a StartTransientUnit call, unwrapped.
+    fn property<'a>(call: &'a Message, name: &str) -> Option<&'a Value> {
+        let Value::Array(_, props) = &call.body[2] else { panic!("{:?}", call.body) };
+        props.iter().find_map(|p| match p {
+            Value::Struct(f) if f[0] == Value::Str(name.into()) => match &f[1] {
+                Value::Variant(v) => Some(&**v),
+                v => panic!("{v:?}"),
+            },
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn starts_a_scope_with_the_limits_as_properties() {
+        let (mut bus, _thread) = ossteam_dbus::test_bus::connect(|m, out| {
+            out.push(ossteam_dbus::test_bus::reply(m, vec![Value::Path("/org/freedesktop/systemd1/job/7".into())]));
+            true
+        });
+        let l = Limits { memory: Some(64 << 20), cpus: Some(1.5), pids: Some(32), ..Default::default() };
+        let call = start_scope(1234, "vssb-x.scope", &l);
+        assert_eq!(call.destination.as_deref(), Some(SYSTEMD));
+        assert_eq!(call.member.as_deref(), Some("StartTransientUnit"));
+        assert_eq!(&call.body[..2], &[Value::Str("vssb-x.scope".into()), Value::Str("fail".into())]);
+        assert_eq!(property(&call, "PIDs"), Some(&Value::Array(Type::U32, vec![Value::U32(1234)])));
+        assert_eq!(property(&call, "MemoryMax"), Some(&Value::U64(64 << 20)));
+        assert_eq!(property(&call, "MemorySwapMax"), Some(&Value::U64(0)));
+        assert_eq!(property(&call, "CPUQuotaPerSecUSec"), Some(&Value::U64(1_500_000)));
+        assert_eq!(property(&call, "TasksMax"), Some(&Value::U64(32)));
+        assert_eq!(call.body[3], Value::Array(Type::Struct(vec![Type::Str, Type::Array(Box::new(Type::Struct(vec![Type::Str, Type::Variant])))]), vec![]));
+        // It encodes, and a bus takes it.
+        assert!(bus.call(call).is_ok());
+        // Without limits: no limit properties.
+        let call = start_scope(1, "vssb-y.scope", &Limits::default());
+        assert!(property(&call, "MemoryMax").is_none() && property(&call, "TasksMax").is_none());
+        assert!(property(&call, "CollectMode").is_some());
+    }
+
+    #[test]
+    fn an_error_reply_is_an_error() {
+        let (mut bus, _thread) = ossteam_dbus::test_bus::connect(|m, out| {
+            out.push(ossteam_dbus::test_bus::error(m, "org.freedesktop.systemd1.UnitExists"));
+            true
+        });
+        let e = bus.call(start_scope(1, "vssb-z.scope", &Limits::default())).expect_err("error reply");
+        assert!(e.to_string().contains("UnitExists"), "{e}");
+    }
 
     /// Controller files in a temporary directory.
     fn check(files: &[(&str, &str)], l: &Limits) -> InEffect {

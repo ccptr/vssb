@@ -12,7 +12,7 @@ pub struct Support {
     /// signals and abstract sockets, 9+ guards unix sockets on disk.
     pub landlock_abi: u32,
     pub seccomp: bool,
-    /// A systemd user manager is reachable over D-Bus with `busctl`, so
+    /// A systemd user manager answers on the user bus, so
     /// [`Limits`](crate::Limits) can be applied through a scope.
     pub systemd_user: bool,
 }
@@ -44,21 +44,15 @@ fn userns_works() -> bool {
     }
 }
 
-fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
-}
-
 pub fn probe() -> Support {
     let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
     unsafe { libc::uname(&mut uts) };
     let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }.to_string_lossy().into_owned();
-    let bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
-        || std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|d| std::path::Path::new(&d).join("bus").exists());
     Support {
         kernel: format!("{release} ({})", std::env::consts::ARCH),
         user_namespaces: userns_works(),
         landlock_abi: sys::landlock_abi(),
         seccomp: unsafe { libc::prctl(libc::PR_GET_SECCOMP) } >= 0,
-        systemd_user: bus && on_path("busctl"),
+        systemd_user: crate::cgroup::systemd_answers(),
     }
 }

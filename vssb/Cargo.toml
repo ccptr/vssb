@@ -8,6 +8,11 @@ publish = false
 
 [dependencies]
 libc = "0.2.191"
+# The systemd user manager's StartTransientUnit, without a subprocess.
+ossteam-dbus = { path = "../../ossteam/crates/ossteam-dbus" }
+
+[dev-dependencies]
+ossteam-dbus = { path = "../../ossteam/crates/ossteam-dbus", features = ["test-bus"] }
 
 [features]
 default = ["proxy"]

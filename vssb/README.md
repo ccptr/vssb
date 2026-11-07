@@ -55,11 +55,13 @@ are the guarantees towards the host, each with an integration test in
 - **No process-wide state.** No threads, no signal handlers, no changes
   to the host's signal mask (it blocks signals on the calling thread only
   for the moment of clone), and no re-execution of the host. Limits come
-  from asking the systemd user manager over D-Bus (`busctl`) to move the
-  waiting child into a new scope, rather than re-running the host under
+  from asking the systemd user manager over D-Bus to move the waiting
+  child into a new scope: a blocking call on the spawning thread, with no
+  subprocess and a 10 s timeout, rather than re-running the host under
   `systemd-run`.
 - **Your `waitpid(-1)` can't steal it.** The sandbox is a "clone child"
   (no exit signal): it sends no SIGCHLD and only `__WALL` waits see it.
+  vssb starts no other process, so there is nothing else to steal.
   `Child` waits on its pidfd, which can also go into your poll loop or
   async runtime (`Child::pidfd`).
 - **It dies with your process, not with a thread.** Init holds one end of
@@ -157,7 +159,7 @@ processes spread too); `List(cpus)` takes the first N of the given CPUs.
 - Unprivileged user namespaces. Ubuntu 24.04+ restricts them through
   AppArmor and needs a profile for the host binary.
 - For a memory limit, a cgroup quota for cpus, pids.max or the cgroup
-  freezer: a systemd user manager and `busctl`, or a cgroup v2 directory
+  freezer: a systemd user manager on the user bus, or a cgroup v2 directory
   you can write to (`Cgroup::Join`). The fallbacks above need neither.
 - `Child::signal` forwards SIGHUP, INT, QUIT, USR1, USR2, ALRM, TERM, CONT,
   TSTP and WINCH. Pausing the whole sandbox needs `freeze`.
@@ -181,6 +183,9 @@ per-namespace `pid_max`). They don't need internet access.
 
 ## License
 
-Mozilla Public License 2.0 ([`LICENSE`](../LICENSE)): you can link it into
+Mozilla Public License 2.0 ([`LICENSE`](../LICENSE)). It links
+`ossteam-dbus`, which is LGPL-2.1-or-later for now (to be relicensed), so
+until then a statically linked closed-source program also has to allow
+relinking against a modified `ossteam-dbus`. Otherwise you can link it into
 a program under any license, including a closed one, statically or not;
 changes to its own files stay under the MPL.

@@ -18,7 +18,9 @@ README.md for the design and the guarantees towards the host program.
   Landlock (raw syscalls; the parent works out the rights).
 - `src/seccomp.rs`: hand-assembled BPF. `src/report.rs`: fixed-size
   failure records from the child and their messages. `src/cgroup.rs`:
-  systemd scope over `busctl`. `src/proxy.rs`: filtering HTTP proxy.
+  systemd scope over D-Bus (`ossteam-dbus`, from the ossteam checkout
+  next to this one; a blocking call, no subprocess). `src/proxy.rs`:
+  filtering HTTP proxy.
 
 ## Invariants
 

@@ -47,7 +47,7 @@ impl Audit {
         if copy < 0 {
             return Err(os_err(&format!("copying descriptor {fd}")));
         }
-        // Keep it out of helpers vssr runs (busctl). Not for 0-2, which the
+        // Keep it out of anything started later. Not for 0-2, which the
         // program inherits as its stdio.
         if fd > 2 {
             let fdfl = unsafe { libc::fcntl(fd, libc::F_GETFD) };

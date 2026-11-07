@@ -32,9 +32,9 @@ pub fn run(json: bool, plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
     line(s.seccomp, "seccomp", format!("{} syscalls denied by default, {} BPF instructions", f.denied().len(), f.len()));
 
     let detail = if s.systemd_user {
-        "busctl and the systemd user manager are available"
+        "the systemd user manager answers on the user bus"
     } else {
-        "no systemd user manager reachable with busctl: no memory limit; cpus pin, pids size the PID namespace"
+        "no systemd user manager on the user bus: no memory limit (unless --cgroup); cpus pin, pids size the PID namespace"
     };
     // Limits are optional, so this never fails the check by itself.
     println!("{} {:<16} {detail}", if s.systemd_user { " ok " } else { " -- " }, "resource limits");

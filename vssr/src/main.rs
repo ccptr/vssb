@@ -293,7 +293,7 @@ fn passed_fds(specs: &[String], audit_fd: Option<i32>) -> Result<Vec<(i32, Owned
         if copy < 0 {
             bail!("--pass-fd {spec}: descriptor {n}: {}", std::io::Error::last_os_error());
         }
-        // The program gets the copy; keep the original out of helpers vssr runs.
+        // The program gets the copy; keep the original out of anything started later.
         if n > 2 {
             let fl = unsafe { libc::fcntl(n, libc::F_GETFD) };
             unsafe { libc::fcntl(n, libc::F_SETFD, fl | libc::FD_CLOEXEC) };

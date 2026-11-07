@@ -970,6 +970,48 @@ fn joining_a_directory_that_is_not_a_cgroup_is_refused() {
     assert!(std::fs::read_dir(&target.0).unwrap().next().is_none());
 }
 
+/// A host thread that reaps every child (`waitpid(-1)`) can't take
+/// anything vssb needs: the scope still comes up. In a process of its own
+/// (the test re-runs itself), so the reaper can't take other tests'
+/// children.
+#[test]
+fn limits_survive_a_host_that_reaps_every_child() {
+    const INSIDE: &str = "VSSB_TEST_REAPING_HOST";
+    if std::env::var_os(INSIDE).is_none() {
+        if !vssb::probe().systemd_user {
+            eprintln!("skipped: no systemd user manager");
+            return;
+        }
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "limits_survive_a_host_that_reaps_every_child", "--test-threads=1"])
+            .env(INSIDE, "1")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "{st}");
+        return;
+    }
+    static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let reaper = std::thread::spawn(|| {
+        while !STOP.load(Ordering::Relaxed) {
+            if unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } <= 0 {
+                std::thread::yield_now();
+            }
+        }
+    });
+    let d = Dir::new();
+    let mut sb = sandbox(&d);
+    sb.limits(Limits { memory: Some(256 << 20), pids: Some(64), ..Default::default() });
+    for _ in 0..5 {
+        let mut child = sb.spawn(sh(&d, "true")).expect("spawn");
+        assert_eq!(child.enforcement().memory, Some(vssb::Via::Cgroup));
+        assert_eq!(child.enforcement().pids, Some(vssb::Via::Cgroup));
+        assert!(child.wait().unwrap().success());
+    }
+    STOP.store(true, Ordering::Relaxed);
+    reaper.join().unwrap();
+}
+
 /// Runs in a delegated systemd scope (the test re-runs itself there): the
 /// sandbox starts in the given cgroup, and the limits are written to it.
 #[test]

@@ -37,13 +37,14 @@ resolves.
 - Unprivileged user namespaces enabled (the default on most distributions;
   Ubuntu 24.04+ restricts them through AppArmor and needs a profile).
 - x86_64 or aarch64.
-- For a memory limit: `busctl` and a systemd user manager, or a cgroup
+- For a memory limit: a systemd user manager, or a cgroup
   you prepared (`--cgroup`). Without either,
   `cpus` pins the sandbox to that many CPUs and `pids` sizes its PID
   namespace (Linux 6.14+) instead; see vssb's README for the details.
 
 The sandbox itself is built by [vssb](../vssb), the library crate next to
-vssr in this workspace. Build with `cargo build --release` from the
+vssr in this workspace; it needs the ossteam repository checked out next
+to this one (`../ossteam`, for `ossteam-dbus`). Build with `cargo build --release` from the
 workspace root; the binary is `target/release/vssr` there.
 
 ## Command line
@@ -302,7 +303,7 @@ sandboxing:
 
 1. vssb `clone`s a child into new user, mount, PID, network, IPC and UTS
    namespaces and writes its uid/gid maps. With limits, it asks the
-   systemd user manager over D-Bus (`busctl`) for a transient scope
+   systemd user manager over D-Bus for a transient scope
    (`vssb-<id>.scope`) holding the child, then the child enters a new
    cgroup namespace rooted there. Without a scope, init applies the
    fallbacks instead (CPU pinning, the PID namespace's size), and the

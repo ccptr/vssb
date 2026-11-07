@@ -24,7 +24,9 @@ is covered in [gui.md](gui.md).
   Linux Runtime can't run inside it. `gui.md` covers part of this
   (Wayland, D-Bus, GPU, audio); none of it is implemented yet.
 - **License: MPL-2.0.** A closed-source client can link vssb, statically
-  or not. Changes to vssb's own files stay under the MPL.
+  or not. Changes to vssb's own files stay under the MPL. vssb links
+  `ossteam-dbus`, which is LGPL-2.1-or-later until it is relicensed; until
+  then static linking also means allowing relinking against it.
 
 ## 1. In-process embedding (linking vssb)
 
@@ -41,10 +43,12 @@ What a host gets (details and the test for each in vssb's README):
 - It dies with the host process (init watches a control socket), not
   with the spawning thread, and dropping a `Child` kills and reaps it.
 - Nothing is read from the host process: environment, working directory
-  and paths are explicit.
+  and paths are explicit (only the user bus's address comes from
+  `DBUS_SESSION_BUS_ADDRESS` or `XDG_RUNTIME_DIR`, for limits).
 - Init closes every descriptor except the ones passed with
   `Command::pass_fd`, so other threads' sockets don't leak in.
-- Limits through a systemd user scope over D-Bus, or
+- Limits through a systemd user scope over D-Bus (a blocking call, no
+  subprocess), or
   `Cgroup::Join(dir)` for a host that manages its own cgroups. Without
   a cgroup, cpus fall back to pinning, pids to sizing the PID namespace
   and `Child::freeze` to SIGSTOP/SIGCONT; only a memory limit needs one.
@@ -54,7 +58,7 @@ What a host gets (details and the test for each in vssb's README):
   sandboxed launch, and `Error` variants that tell setup failures,
   missing kernel support and exec failures apart.
 - Startup: about 4.5 ms from `vssr run` to exit for `true` (release
-  build, Linux 7.2), about 10 ms with a systemd scope for limits, and
+  build, Linux 7.2), about 8 ms with a systemd scope for limits, and
   about 5 ms with the proxy.
 
 Gaps for a host:
@@ -62,7 +66,6 @@ Gaps for a host:
 | Gap | Where | Why it matters |
 |---|---|---|
 | Rust only: no C ABI, no `cdylib` | `vssb/src/lib.rs` | A C or C++ client needs a small FFI crate (opaque `Sandbox`, `Command` and `Child` handles, the pidfd, errors as codes and strings). |
-| Limits run `busctl` as an ordinary child | `vssb/src/cgroup.rs:78` | `std::process` waits for that pid alone, so a host that reaps with `waitpid(-1)` can take its status first. The scope then counts as failed: cpus and pids use their fallbacks, and a memory limit fails the spawn in strict mode (the default) or is dropped without it. `Cgroup::Join` (`--cgroup`) or the fallbacks alone (`Cgroup::Inherit`) avoid it; a D-Bus call without a subprocess would fix it. |
 | No policy layer in the library | `vssr/src/policy.rs` | vssr's `Policy` → `Plan` lives in the binary crate and reads `$HOME` and the working directory itself (`policy.rs:327`). A host that wants vssr's policy files would need it split out with explicit inputs. A host with its own configuration builds a `Sandbox` directly and needs none of it. |
 | AppArmor on Ubuntu 24.04+ | vssb README | Unprivileged user namespaces need a profile for the binary that creates them, so in-process use puts the whole client under that profile. A helper binary keeps the profile small. |
 | Forking without exec during a spawn | vssb README | The forked copy keeps the control socket open, so `spawn` waits until it exits or execs (`std::process` has the same property). |
@@ -94,7 +97,7 @@ What already works:
   example a pre-connected IPC socket); nothing else is inherited.
 - `--cgroup DIR` starts the sandbox in a cgroup the client prepared
   (a delegated subtree), with the limits written to it: a memory limit
-  without systemd, and no `busctl` subprocess.
+  without systemd.
 - `--dry-run --json` and `vssr check --json` print the plan and the
   kernel's support for programs (environment variables by name only).
 - Several sandboxes can run at once, each in its own namespaces.
@@ -134,9 +137,9 @@ left behind, freezing a paused game, and the audit trail.
 1. ~~Integration contract for `vssr run`~~ (done 2026-11-07:
    `--audit-fd`, `--quiet`, `--pass-fd`, `--cgroup`, `--json`, and
    `-p /proc/self/fd/N` and `start` as the ready event documented).
-2. **Limits without a subprocess**: create the scope over D-Bus from
-   vssb itself instead of running `busctl`, so a host's `waitpid(-1)`
-   can't interfere.
+2. ~~Limits without a subprocess~~ (done 2026-11-07: the scope comes
+   from a D-Bus call through `ossteam-dbus`; relicensing that crate
+   for closed-source static linking is pending).
 3. **A C API** (`vssb-ffi`), if a client not written in Rust is meant
    to link it.
 4. **Split `Policy` → `Plan` into a library**, with explicit inputs

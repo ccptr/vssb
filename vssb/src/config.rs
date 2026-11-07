@@ -256,7 +256,7 @@ pub enum Cgroup {
     /// pids) can be set.
     Inherit,
     /// A new transient systemd user scope (`vssb-<id>.scope`), created
-    /// over D-Bus with `busctl`, even without limits (for
+    /// over D-Bus (no subprocess), even without limits (for
     /// [`Child::freeze`](crate::Child::freeze) through the cgroup). In
     /// strict mode, failing to create it is an error.
     SystemdUserScope,
