@@ -239,7 +239,8 @@ xdg-dbus-proxy "$DBUS_SESSION_BUS_ADDRESS" $XDG_RUNTIME_DIR/vssr/<id>/bus \
 Built on 2026-11-07 as above, with these choices:
 
 - Enabled by `dbus.session = true` (`--dbus`, implied by `--dbus-talk`,
-  `--dbus-own` and `--dbus-see`); the lists without it are an error.
+  `--dbus-own` and `--dbus-see`); the lists without it give a warning
+  and no bus.
   `session` leaves room for a filtered system bus later.
 - The proxy binds its socket through `/proc/self/fd/N/bus`, N being the
   run directory it inherits, so no symlink on the way is followed (as

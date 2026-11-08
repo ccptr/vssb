@@ -781,7 +781,7 @@ impl Plan {
             Some(add_dbus(d, uid, session_bus()?, &mut mounts, &mut warnings)?)
         } else {
             if [&d.talk, &d.own, &d.see, &d.call, &d.broadcast].iter().any(|l| !l.is_empty()) {
-                bail!("the dbus lists only apply with dbus.session = true");
+                warnings.push("dbus: the name lists only apply with dbus.session = true; the program gets no bus".into());
             }
             None
         };
@@ -1542,8 +1542,9 @@ mod tests {
         let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let mut p = Policy::default_policy();
         p.dbus.talk = vec!["org.example.App".into()];
-        let err = Plan::build(&p, &FsOverrides::default(), &dir).unwrap_err();
-        assert!(err.to_string().contains("dbus.session = true"), "{err}");
+        let plan = Plan::build(&p, &FsOverrides::default(), &dir).unwrap();
+        assert!(plan.dbus.is_none());
+        assert!(plan.warnings.iter().any(|w| w.contains("dbus.session = true")), "{:?}", plan.warnings);
         p.dbus.session = true;
         p.sandbox.uid = Some(unsafe { libc::getuid() } + 1);
         let err = Plan::build(&p, &FsOverrides::default(), &dir).unwrap_err();

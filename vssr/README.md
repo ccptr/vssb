@@ -281,7 +281,7 @@ set) and `event`:
 | `note` | something detection left out, and why (`text`) |
 | `start` | the program has been exec'd: the ready event (`host_pid`, `limits`, …) |
 | `setup_failed` | the sandbox couldn't be set up or the program not run (`code`, `error`); no `start` follows |
-| `warning` | a limit isn't in effect (`limit`, `text`), `insecure_wayland` let escape protocols through (`wayland_escapes`), or a D-Bus name reaches a service that runs host commands (`text`) |
+| `warning` | a limit isn't in effect (`limit`, `text`), `insecure_wayland` let escape protocols through (`wayland_escapes`), a D-Bus name reaches a service that runs host commands, or the `[dbus]` name lists are set without `session = true` (`text`) |
 | `wayland` | the security context is in place (`compositor`, `app_id`, `globals` offered through it, `escapes`) |
 | `dbus` | the D-Bus proxy accepts connections (`upstream`, `socket`, `rules`, `proxy_pid`) |
 | `net`, `net_close` | each proxied connection: allowed, denied or failed, then its byte counts |

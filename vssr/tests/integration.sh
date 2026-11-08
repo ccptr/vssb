@@ -529,6 +529,10 @@ if command -v dbus-daemon >/dev/null && command -v dbus-test-tool >/dev/null && 
     expect_out "  ...and no other" '^refused$' -- run --dbus -- sh -c "$own"
     expect_out "the session bus is hidden where a bind shows it" '^hidden$' -- run --dbus --ro "$WORK:/hostwork" -- sh -c 'test -S /hostwork/bus && echo visible || echo hidden'
     expect "a host runtime directory in the private one's place is refused" 125 -- run --dbus --ro "$XDG_RUNTIME_DIR" -- true
+    printf '[fs]\nrw = ["."]\n[dbus]\ntalk = ["org.vssr.Allowed"]\n' > nosession.toml
+    expect_out "name lists without dbus.session give a warning" '^vssr: warning: dbus: .*session = true' -- run -p nosession.toml -- true
+    expect_out "  ...and run without one" '^nobus$' -- run -p nosession.toml -- sh -c 'test -z "$DBUS_SESSION_BUS_ADDRESS" && ! test -e /run/user/'"$(id -u)"'/bus && echo nobus'
+    rm -f nosession.toml
     bid=dbus-test-$$
     VSSR_ID=$bid "$V" run --dbus -- sh -c 'test -S "$XDG_RUNTIME_DIR/bus"' >/dev/null 2>&1 && [ ! -e "$XDG_RUNTIME_DIR/vssr/$bid" ] \
         && ! pgrep -f "^xdg-dbus-proxy unix:path=$WORK/bus" >/dev/null \
