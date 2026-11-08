@@ -23,6 +23,9 @@ into a `vssb::Sandbox` and `vssb::Command`.
   for directories to expose; `policy.rs` decides what is mounted.
 - `src/audit.rs` (JSON-lines log, fed by `vssb::proxy` events too),
   `src/check.rs` (`vssb::probe`), `src/util.rs`.
+- `examples/`: policy files, and `wayland-context.rs`, the prototype of
+  gui.md's Wayland decision gate (run it against a headless compositor
+  only).
 
 ## Invariants
 

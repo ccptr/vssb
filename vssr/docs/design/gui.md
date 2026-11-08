@@ -1,6 +1,8 @@
 # Design note: GUI applications
 
-Status: proposal, 2026-11-05. Nothing here is implemented yet. Part of
+Status: proposal, 2026-11-05. Nothing here is implemented yet, apart
+from the prototype of the Wayland decision gate (1), run on sway on
+2026-11-07. Part of
 the general-purpose direction in [ergonomics.md](ergonomics.md).
 
 ## Problem
@@ -110,6 +112,7 @@ through such a socket and list the globals it sees:
   `insecure_wayland = true`, and says which protocols leak.
 - wlroots compositors (sway) reportedly hide privileged protocols from
   security-context clients; verify on the headless sway used for tests.
+  (Verified, see below.)
 - Hyprland also has a permission system for screen capture and virtual
   input in its configuration (to verify). That would be a host-wide
   setting the user configures, not something vssr can rely on.
@@ -117,6 +120,42 @@ through such a socket and list the globals it sees:
 The check runs at every start: vssr lists the globals through the new
 socket and refuses (or warns, with `insecure_wayland`) if a privileged
 one appears. That check is also the main integration test.
+
+**Prototype results (2026-11-07).** `vssr/examples/wayland-context.rs`
+does the sequence above by hand (about 300 lines over `libc`), then
+lists the globals through the new socket. Run against a headless sway
+1.12 (`WLR_BACKENDS=headless WLR_RENDERER=pixman`, socket `wayland-2`):
+
+- The gate passes on sway. Of 55 globals an ordinary client sees, a
+  client through the listener sees 35. Hidden: screencopy, ext image
+  copy capture, export-dmabuf, both data-control protocols, virtual
+  keyboard and pointer, input method, both foreign-toplevel protocols,
+  gamma control, output management and power, session lock, layer
+  shell, workspaces, transient seats, keyboard-shortcuts inhibit,
+  `zxdg_output_manager_v1` and the security-context manager itself (so
+  a sandboxed client can't create a context of its own).
+- Hiding covers binding too: binding the virtual keyboard by its global
+  name through the listener is a protocol error ("global … is
+  unavailable") and the connection is closed.
+- Still visible that could matter: `ext_idle_notifier_v1` (tells the app
+  when the user is idle or active; a presence leak, not an escape) and
+  `xdg_activation_v1` (requests for focus, which need a token). The check
+  at start should refuse only on the escape set (capture, data control,
+  virtual input, input method) and leave these to the profile.
+- The listener outlives the connection that created it, so the
+  supervisor can close that connection, and its copies of the listening
+  socket and the pipe's read end, right after `commit`.
+- Closing the pipe's write end makes the socket refuse new connections
+  (`ECONNREFUSED`) at once, but connections already made keep working.
+  That is enough: the sandbox's clients die with its PID namespace.
+- Real clients work through it: `wayland-info`, and `foot`, whose window
+  sway reports over IPC with `sandbox_engine: vssr`, `sandbox_app_id`
+  and `sandbox_instance_id` set. Missing `zxdg_output_manager_v1` didn't
+  bother either; check it again for the private Xwayland (4).
+
+Not yet checked: Hyprland. The prototype only ran on a headless
+compositor; Hyprland's part of the gate needs a Hyprland instance that
+isn't the live session (or an explicit decision to run it there).
 
 ## 2. Connecting to specific sockets (`fs.sockets`)
 
@@ -223,7 +262,8 @@ To explore (unverified):
 
 0. **Prototype the decision gate (1):** a security-context listener plus
    a global listing, against Hyprland and headless sway. About a day; it
-   decides whether the rest is worth building on this compositor.
+   decides whether the rest is worth building on this compositor. Done
+   for sway on 2026-11-07 (it passes, see 1); Hyprland is still open.
 1. `fs.sockets` with the Landlock connect right (2); useful headless too.
 2. Wayland through a security context, with the check at every start (1).
 3. `xdg-dbus-proxy` and `[dbus]` (3).
