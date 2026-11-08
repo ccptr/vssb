@@ -17,12 +17,14 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 /// A mount, ready for the child.
 pub(crate) enum POp {
     Bind { src: CString, rw: bool },
+    /// A host unix socket, read-only; the child checks that it is one.
+    Socket { src: CString },
     Tmpfs { opts: Vec<(CString, CString)> },
     Deny,
     Symlink { target: CString },
@@ -210,7 +212,8 @@ pub(crate) fn resolve_mounts(sb: &Sandbox) -> Result<Vec<Mount>> {
         if m.dest == Path::new("/") {
             return Err(Error::Config("'/' can't be mounted over; list the directories to expose instead".into()));
         }
-        if let MountKind::Bind { src, .. } = &mut m.kind {
+        let socket = matches!(m.kind, MountKind::Socket { .. });
+        if let MountKind::Bind { src, .. } | MountKind::Socket { src } = &mut m.kind {
             if !src.is_absolute() {
                 return Err(Error::Config(format!("mount source {} must be absolute", src.display())));
             }
@@ -225,6 +228,10 @@ pub(crate) fn resolve_mounts(sb: &Sandbox) -> Result<Vec<Mount>> {
                     return Err(Error::Config(format!("{}: no such file or directory (mark the mount optional if that's fine)", src.display())));
                 }
                 Err(e) => return Err(Error::io(src.display().to_string(), e)),
+            }
+            // For a clear message; the child checks again on what it mounts.
+            if socket && !std::fs::metadata(&*src).is_ok_and(|md| md.file_type().is_socket()) {
+                return Err(Error::Config(format!("{} is not a unix socket", src.display())));
             }
         }
         map.insert(m.dest.clone(), m);
@@ -362,6 +369,7 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
         let comps = m.dest.components().skip(1).map(|c| cstr(c.as_os_str())).collect::<Result<Vec<_>>>()?;
         let op = match &m.kind {
             MountKind::Bind { src, writable } => POp::Bind { src: cstr(src)?, rw: *writable },
+            MountKind::Socket { src } => POp::Socket { src: cstr(src)? },
             MountKind::Tmpfs { size } => POp::Tmpfs { opts: tmpfs_opts("0755", *size)? },
             MountKind::Deny => POp::Deny,
             MountKind::Symlink { target } => POp::Symlink { target: cstr(target)? },

@@ -33,7 +33,7 @@ The same layers as vssr:
 | Layer | Mechanism | What it does |
 |---|---|---|
 | Filesystem view | mount namespace, new root on tmpfs | Only listed paths exist: read-only, writable, an empty tmpfs or hidden. `/proc`, `/dev` and `/tmp` are fresh. |
-| Filesystem rights | Landlock (ABI 1–9) | A second, independent check of the read/write/exec split. With ABI 9+, host unix sockets exposed read-only can't be connected to. |
+| Filesystem rights | Landlock (ABI 1–9) | A second, independent check of the read/write/exec split. With ABI 9+, host unix sockets exposed read-only can't be connected to; `Mount::socket` hands over one that can, and no other. |
 | Processes | PID, IPC, UTS, cgroup namespaces | The program sees only its own processes; everything it started is killed when it exits. |
 | Network | network namespace | `Net::None`: loopback only, plus listeners handed to the host (for the filtering `proxy`). `Net::Host`: the host network, optionally limited to TCP ports by Landlock. |
 | Syscalls | seccomp BPF | No nested namespaces, mount, ptrace, bpf, io_uring, perf, keyrings, kernel modules, raw sockets or TIOCSTI. |

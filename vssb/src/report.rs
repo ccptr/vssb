@@ -40,6 +40,7 @@ pub(crate) const EXEC: u32 = 31;
 pub(crate) const PID_MAX: u32 = 32;
 pub(crate) const PIN: u32 = 33;
 pub(crate) const SOURCE_SYMLINK: u32 = 34;
+pub(crate) const NOT_SOCKET: u32 = 35;
 
 /// `a` when a step isn't about one mount.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -111,6 +112,7 @@ pub(crate) fn to_error(r: Report, cx: &Context) -> Error {
         MOUNT_PRIVATE => "making mounts private".into(),
         OPEN_SOURCE => format!("cloning the mount source of {shown}"),
         SOURCE_SYMLINK => format!("the source of {shown} has a symlink in its path (it changed after it was resolved, or the mount refuses symlinks)"),
+        NOT_SOCKET => format!("the source of {shown} is not a unix socket (it changed after it was checked)"),
         SET_ATTR => format!("setting mount flags for {shown}"),
         NEW_FS if r.a == NONE => "creating an internal filesystem".into(),
         NEW_FS => format!("creating the filesystem for {shown}"),

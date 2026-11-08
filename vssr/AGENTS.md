@@ -44,8 +44,9 @@ into a `vssb::Sandbox` and `vssb::Command`.
   symlink is followed under a writable directory (`Plan::writable`).
   Symlinks are judged by their canonical location (`util::resolve_guarded`),
   never by how a path is spelt.
-- Bind sources reach vssb canonical and marked `no_symlinks`, so a symlink
-  planted after the check is an error, not a new destination.
+- Bind and socket sources reach vssb canonical and marked `no_symlinks`,
+  so a symlink planted after the check is an error, not a new destination.
+  A socket entry always mounts the socket itself, never a symlink to it.
 - The audit log is opened without following a symlink the sandbox could
   have planted (`resolve_guarded` on its directory, then `openat2` and
   `O_NOFOLLOW`), and only as a regular file. Missing directories on the

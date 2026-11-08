@@ -143,6 +143,23 @@ s=socket.socket(socket.AF_UNIX)
 try: s.connect("../hs/s"); print("connected")
 except OSError as e: print(e)'
 kill $sp 2>/dev/null
+# --socket hands over exactly one socket, even inside that read-only directory.
+mkdir -p ../hs2
+( cd .. && python3 -c '
+import socket,time
+a=socket.socket(socket.AF_UNIX); a.bind("hs2/given"); a.listen()
+b=socket.socket(socket.AF_UNIX); b.bind("hs2/other"); b.listen(); time.sleep(5)' ) &
+sp=$!
+sleep 0.3
+connect_py='import socket,sys
+s=socket.socket(socket.AF_UNIX)
+try: s.connect(sys.argv[1]); print("connected")
+except OSError as e: print(e)'
+expect_out "a --socket can be connected to" '^connected$' -- run --socket "$WORK/hs2/given:/run/given.sock" -- python3 -c "$connect_py" /run/given.sock
+expect_out "  ...and only that one in its directory" 'Errno 13|Errno 1' -- run --ro "$WORK/hs2" --socket "$WORK/hs2/given" -- python3 -c "$connect_py" "$WORK/hs2/other"
+expect_out "  ...while it works there"   '^connected$' -- run --ro "$WORK/hs2" --socket "$WORK/hs2/given" -- python3 -c "$connect_py" "$WORK/hs2/given"
+kill $sp 2>/dev/null
+expect "--socket refuses a non-socket" 125 -- run --socket "$WORK/audit-sentinel:/run/s" -- true
 expect_out "agents can use their own unix sockets" '^ok$' -- run -- python3 -c 'import socket,os
 p="/tmp/own.sock"; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen()
 c=socket.socket(socket.AF_UNIX); c.connect(p); print("ok")'

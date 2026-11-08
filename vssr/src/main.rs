@@ -80,6 +80,9 @@ struct RunArgs {
     /// Hide a path that would otherwise be visible
     #[arg(long, value_name = "PATH")]
     deny: Vec<String>,
+    /// Let the program connect to this host unix socket (SRC or SRC:DEST)
+    #[arg(long, value_name = "PATH")]
+    socket: Vec<String>,
     /// Network mode
     #[arg(long, value_enum)]
     net: Option<NetArg>,
@@ -196,7 +199,7 @@ fn resolve(args: &RunArgs) -> Result<Plan> {
     };
 
     let mut fs = FsOverrides::default();
-    for (kind, list) in [(FsKind::Tmpfs, &args.tmpfs), (FsKind::Ro, &args.ro), (FsKind::Rw, &args.rw), (FsKind::Deny, &args.deny)] {
+    for (kind, list) in [(FsKind::Tmpfs, &args.tmpfs), (FsKind::Ro, &args.ro), (FsKind::Rw, &args.rw), (FsKind::Socket, &args.socket), (FsKind::Deny, &args.deny)] {
         fs.entries.extend(list.iter().map(|s| (kind, s.clone())));
     }
     if let Some(n) = args.net {

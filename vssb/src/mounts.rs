@@ -231,6 +231,29 @@ pub(crate) fn build(p: &mut Prepared) -> R<()> {
                 Err(libc::ELOOP) => return Err(Report::new(report::SOURCE_SYMLINK, libc::ELOOP, ix)),
                 Err(e) => return Err(Report::new(report::OPEN_SOURCE, e, ix)),
             },
+            POp::Socket { src } => match clone_source(src) {
+                Ok(fd) => {
+                    // What is actually mounted must be a socket, whatever
+                    // the parent saw: its rule lets the program connect.
+                    match file_type(fd) {
+                        Ok(libc::S_IFSOCK) => {}
+                        Ok(_) => {
+                            close(fd);
+                            return Err(Report::new(report::NOT_SOCKET, libc::ENOTSOCK, ix));
+                        }
+                        Err(e) => {
+                            close(fd);
+                            return Err(Report::new(report::OPEN_SOURCE, e, ix));
+                        }
+                    }
+                    let a = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC;
+                    set_attr(fd, a, true).map_err(|e| Report::new(report::SET_ATTR, e, ix))?;
+                    fd
+                }
+                Err(libc::ENOENT) if m.optional => -1,
+                Err(libc::ELOOP) => return Err(Report::new(report::SOURCE_SYMLINK, libc::ELOOP, ix)),
+                Err(e) => return Err(Report::new(report::OPEN_SOURCE, e, ix)),
+            },
             POp::Proc => new_fs(c"proc", std::iter::empty(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)
                 .map_err(|e| Report::new(report::NEW_FS, e, ix))?,
             _ => -1,
@@ -296,7 +319,7 @@ pub(crate) fn build(p: &mut Prepared) -> R<()> {
                     return Err(Report::new(report::SYMLINK, errno(), ix));
                 }
             }
-            POp::Bind { .. } => {
+            POp::Bind { .. } | POp::Socket { .. } => {
                 let src = sources.get(i).copied().unwrap_or(-1);
                 if src < 0 {
                     continue; // optional and missing

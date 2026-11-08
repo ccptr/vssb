@@ -19,7 +19,7 @@ vssr run -p examples/claude-code.toml -- claude -p "fix the failing tests" --dan
 | Layer | Mechanism | What it does |
 |---|---|---|
 | Filesystem view | mount namespace, new root on tmpfs | Only paths the policy lists exist. Each is read-only, read-write, an empty tmpfs or hidden. `/proc`, `/dev` and `/tmp` are fresh and private. |
-| Filesystem rights | Landlock (ABI 1–9) | A second, independent check of the same read/write/exec split. With ABI 9+, host unix sockets exposed read-only (say, a `--ro /run/user/1000` that includes the systemd or docker socket) can't be connected to. |
+| Filesystem rights | Landlock (ABI 1–9) | A second, independent check of the same read/write/exec split. With ABI 9+, host unix sockets exposed read-only (say, a `--ro /run/user/1000` that includes the systemd or docker socket) can't be connected to; `--socket` (`fs.sockets`) hands over one that can, and no other. |
 | Processes | PID, IPC, UTS, cgroup namespaces | The agent sees only its own processes; everything it started is killed when it exits, and the whole sandbox dies if vssr dies. |
 | Network | network namespace + filtering proxy | `none`: loopback only. `proxy`: HTTP(S) only to allow-listed hosts and ports, via a proxy running outside the sandbox, with private/LAN addresses blocked. `host`: the host network, optionally limited to TCP ports by Landlock. |
 | Syscalls | seccomp BPF | No nested namespaces, mount, ptrace, bpf, io_uring, perf, keyrings, kernel modules, raw/packet sockets or terminal injection (TIOCSTI). |
@@ -108,6 +108,7 @@ rw     = ["$PWD"]
 tmpfs  = ["~"]
 deny   = ["$PWD/.env", "~/.ssh"]
 noexec = ["/tmp"]       # must name one of the entries above exactly
+sockets = ["$SSH_AUTH_SOCK"]   # host unix sockets the program may connect to (SRC or SRC:DEST)
 tmpfs_size = "2G"
 
 [net]
@@ -285,6 +286,11 @@ Think about what you expose, not only what you block.
   create and use their own sockets there fail with EACCES; use a different
   directory (the default `/tmp` is fine unless you mount something
   read-only under it).
+- A `--socket` (`fs.sockets`) entry is a capability: the program can do
+  whatever the service behind it allows. An `ssh-agent` socket lets it
+  sign with your keys (though not read them); a docker or systemd socket
+  amounts to running commands on the host. The source must be a socket,
+  and it is mounted read-only.
 - `--tty` keeps your terminal attached so interactive tools work.
   TIOCSTI is blocked, but the agent can still print escape sequences to
   your terminal; prefer non-tty mode for unattended runs. Ctrl-C and

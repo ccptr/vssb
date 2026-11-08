@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 pub enum MountKind {
     /// A host path (file or directory), read-only or writable.
     Bind { src: PathBuf, writable: bool },
+    /// A host unix socket the program may connect to (and nothing else
+    /// there). The source must be a socket. With Landlock ABI 9+ this is
+    /// the only way to make a host socket connectable short of a writable
+    /// directory; each one is a capability handed to the program.
+    Socket { src: PathBuf },
     /// A fresh, empty, writable tmpfs.
     Tmpfs { size: Option<u64> },
     /// Hide whatever would be visible here: an empty mode-000 directory or
@@ -67,6 +72,17 @@ impl Mount {
 
     pub fn rw_at(src: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> Mount {
         Mount::new(dest, MountKind::Bind { src: src.into(), writable: true })
+    }
+
+    /// A host unix socket at the same place inside, connectable.
+    pub fn socket(path: impl Into<PathBuf>) -> Mount {
+        let p = path.into();
+        Mount::socket_at(p.clone(), p)
+    }
+
+    /// A host unix socket at `dest` inside, connectable.
+    pub fn socket_at(src: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> Mount {
+        Mount::new(dest, MountKind::Socket { src: src.into() })
     }
 
     pub fn tmpfs(dest: impl Into<PathBuf>) -> Mount {

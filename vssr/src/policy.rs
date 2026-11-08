@@ -29,6 +29,8 @@ tmpfs = ["~"]
 ro = []
 deny = []
 noexec = []
+sockets = []           # host unix sockets the program may connect to, e.g. ["$SSH_AUTH_SOCK"];
+                       # each one is a capability: whatever the service behind it allows
 # tmpfs_size = "2G"
 
 [net]
@@ -118,6 +120,7 @@ pub struct FsCfg {
     pub tmpfs: Vec<String>,
     pub deny: Vec<String>,
     pub noexec: Vec<String>,
+    pub sockets: Vec<String>,
     pub tmpfs_size: Option<String>,
 }
 
@@ -130,6 +133,7 @@ impl Default for FsCfg {
             tmpfs: vec![],
             deny: vec![],
             noexec: vec![],
+            sockets: vec![],
             tmpfs_size: None,
         }
     }
@@ -325,13 +329,14 @@ pub enum FsKind {
     Rw,
     Tmpfs,
     Deny,
+    Socket,
 }
 
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub argv: Vec<String>,
-    /// The whole view, system entries included, parents first. Bind
-    /// sources are canonical; host symlinks are `Symlink` entries.
+    /// The whole view, system entries included, parents first. Bind and
+    /// socket sources are canonical; host symlinks are `Symlink` entries.
     pub mounts: Vec<Mount>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
@@ -396,6 +401,7 @@ impl Plan {
             (FsKind::Tmpfs, &fs.tmpfs),
             (FsKind::Ro, &fs.ro),
             (FsKind::Rw, &fs.rw),
+            (FsKind::Socket, &fs.sockets),
             (FsKind::Deny, &fs.deny),
         ] {
             entries.extend(list.iter().map(|s| (kind, s.clone())));
@@ -454,6 +460,19 @@ impl Plan {
                         None => bail!("{}: no such file or directory (prefix the entry with '?' to make it optional)", src.display()),
                     }
                 }
+                // Always the socket itself, never a symlink to it: the
+                // entry grants connecting to what it names.
+                FsKind::Socket => match resolve_guarded(&src, &writable)? {
+                    Some(src) => {
+                        use std::os::unix::fs::FileTypeExt;
+                        if !std::fs::metadata(&src).is_ok_and(|m| m.file_type().is_socket()) {
+                            bail!("socket entry {}: not a unix socket", src.display());
+                        }
+                        Mount { dest, kind: MountKind::Socket { src }, noexec: false, optional, no_symlinks: false }
+                    }
+                    None if optional => continue,
+                    None => bail!("{}: no such socket (prefix the entry with '?' to make it optional)", src.display()),
+                },
             };
             mounts.insert(m.dest.clone(), m);
         }
@@ -572,12 +591,12 @@ impl Plan {
     }
 
     /// The sandbox this plan describes. The view is complete already, so
-    /// vssb's own system view stays off. Bind sources are canonical and
+    /// vssb's own system view stays off. Bind and socket sources are canonical and
     /// checked, so vssb refuses any symlink in them (one planted since).
     pub fn sandbox(&self) -> Sandbox {
         let mut sb = Sandbox::new();
         sb.mounts(self.mounts.iter().map(|m| match m.kind {
-            MountKind::Bind { .. } => m.clone().no_symlinks(),
+            MountKind::Bind { .. } | MountKind::Socket { .. } => m.clone().no_symlinks(),
             _ => m.clone(),
         }))
             .hostname(self.hostname.clone())
@@ -645,6 +664,7 @@ impl Plan {
             .map(|m| {
                 let mut o = match &m.kind {
                     MountKind::Bind { src, writable } => json!({"kind": if *writable { "rw" } else { "ro" }, "src": src}),
+                    MountKind::Socket { src } => json!({"kind": "socket", "src": src}),
                     MountKind::Tmpfs { size } => json!({"kind": "tmpfs", "size": size}),
                     MountKind::Deny => json!({"kind": "deny"}),
                     MountKind::Symlink { target } => json!({"kind": "symlink", "target": target}),
@@ -729,6 +749,8 @@ impl Plan {
                     let mode = if *writable { "rw    " } else { "ro    " };
                     if src == &m.dest { mode.to_string() } else { format!("{mode}<- {} ", src.display()) }
                 }
+                MountKind::Socket { src } if src == &m.dest => "socket ".into(),
+                MountKind::Socket { src } => format!("socket <- {} ", src.display()),
                 MountKind::Tmpfs { .. } => "tmpfs ".into(),
                 MountKind::Deny => "deny  ".into(),
                 MountKind::Symlink { target } => format!("link  -> {} ", target.display()),
@@ -1064,7 +1086,26 @@ mod tests {
         assert!(binds.iter().all(|m| m.no_symlinks));
         // The system view too.
         let plan = Plan::build(&Policy::default(), &FsOverrides::default(), Path::new("/usr")).unwrap();
-        assert!(plan.sandbox().resolved_mounts().unwrap().iter().all(|m| m.no_symlinks == matches!(m.kind, MountKind::Bind { .. })));
+        assert!(plan.sandbox().resolved_mounts().unwrap().iter().all(|m| m.no_symlinks == matches!(m.kind, MountKind::Bind { .. } | MountKind::Socket { .. })));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn socket_entries() {
+        let base = alias_fixture("sock");
+        let _l = std::os::unix::net::UnixListener::bind(base.join("real/s")).unwrap();
+        // Named through a symlink outside the writable directories: the
+        // socket itself is mounted, not a symlink entry.
+        let plan = plan_with(&base, "real/work", &[(FsKind::Rw, "@/real/work"), (FsKind::Socket, "@/alias/s")]).unwrap();
+        let m = plan.mounts.iter().find(|m| m.dest == base.join("alias/s")).unwrap();
+        assert_eq!(m.kind, MountKind::Socket { src: base.join("real/s") });
+        let e = plan_with(&base, "real/work", &[(FsKind::Rw, "@/real/work"), (FsKind::Socket, "@/real/work/sub")]).unwrap_err();
+        assert!(e.to_string().contains("not a unix socket"), "{e}");
+        assert!(plan_with(&base, "real/work", &[(FsKind::Rw, "@/real/work"), (FsKind::Socket, "@/missing")]).is_err());
+        assert!(plan_with(&base, "real/work", &[(FsKind::Rw, "@/real/work"), (FsKind::Socket, "?@/missing")]).is_ok());
+        // A deny entry still wins.
+        let plan = plan_with(&base, "real/work", &[(FsKind::Rw, "@/real/work"), (FsKind::Socket, "@/real/s"), (FsKind::Deny, "@/real/s")]).unwrap();
+        assert!(plan.mounts.iter().any(|m| m.dest == base.join("real/s") && m.kind == MountKind::Deny));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

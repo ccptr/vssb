@@ -458,6 +458,61 @@ fn host_unix_sockets_are_unreachable() {
     assert_eq!(out.trim(), "ok");
 }
 
+#[test]
+fn only_given_sockets_are_connectable() {
+    use std::os::unix::net::UnixListener;
+    let d = Dir::new();
+    let sock_dir = Dir::new();
+    let (given, other) = (sock_dir.0.join("given"), sock_dir.0.join("other"));
+    let l = UnixListener::bind(&given).unwrap();
+    let _o = UnixListener::bind(&other).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut c, _) = l.accept().unwrap();
+        c.write_all(b"hi").unwrap();
+        l
+    });
+    let connect = |p: &Path| format!("import socket\ns=socket.socket(socket.AF_UNIX)\ntry: s.connect({p:?}); print('got', s.recv(2).decode())\nexcept OSError as e: print(e)");
+    // Alone, at another place inside.
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::socket_at(&given, "/run/given.sock"));
+    let out = run(&sb, python(&d, &connect(Path::new("/run/given.sock")))).1;
+    if out.trim() != "got hi" {
+        let _ = std::os::unix::net::UnixStream::connect(&given); // unblock the server
+    }
+    let _l = server.join().unwrap(); // still listening for the rest
+    assert_eq!(out.trim(), "got hi");
+    // Inside the read-only directory it comes from: its neighbour stays
+    // unreachable.
+    if vssb::probe().landlock_abi >= 9 {
+        let mut sb = sandbox(&d);
+        sb.mount(Mount::ro(&sock_dir.0)).mount(Mount::socket(&given));
+        let out = run(&sb, python(&d, &connect(&other))).1;
+        assert!(out.contains("Errno 13") || out.contains("Errno 1"), "{out}");
+        let out = run(&sb, python(&d, &format!("import socket\ns=socket.socket(socket.AF_UNIX); s.connect({given:?}); print('ok')"))).1;
+        assert_eq!(out.trim(), "ok");
+    }
+}
+
+#[test]
+fn socket_entries_take_only_sockets() {
+    let d = Dir::new();
+    let f = d.0.join("plain");
+    std::fs::write(&f, "x").unwrap();
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::socket_at(&f, "/run/s"));
+    match sb.spawn(sh(&d, "true")) {
+        Err(Error::Config(m)) => assert!(m.contains("not a unix socket"), "{m}"),
+        r => panic!("{:?}", r.map(|_| ())),
+    }
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::socket_at(&d.0, "/run/s"));
+    assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))));
+    // Missing and optional: skipped.
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::socket_at(d.0.join("missing"), "/run/s").optional());
+    assert_eq!(code(&sb, &d, "test ! -e /run/s"), 0);
+}
+
 // == syscalls
 
 #[test]

@@ -4,8 +4,9 @@
 //! itself, without allocating.
 //!
 //! The rules repeat the mount view's read/write/exec split as a second,
-//! independent layer, restrict TCP ports when asked, and scope signals and
-//! abstract unix sockets to the sandbox.
+//! independent layer, let the program connect to the host sockets it was
+//! given (and no others), restrict TCP ports when asked, and scope signals
+//! and abstract unix sockets to the sandbox.
 
 use crate::prepare::{POp, PMount};
 use crate::report::{self, Report};
@@ -130,6 +131,8 @@ impl Plan {
         let a = match op {
             POp::Bind { rw: false, .. } => (READ & !EXECUTE) | x,
             POp::Bind { rw: true, .. } | POp::Tmpfs { .. } => rw,
+            // Connecting only: no reading, writing or executing the inode.
+            POp::Socket { .. } => RESOLVE_UNIX,
             POp::Proc => READ_FILE | READ_DIR | WRITE_FILE,
             POp::Dev { .. } => READ_FILE | READ_DIR | WRITE_FILE | IOCTL_DEV,
             POp::Deny | POp::Symlink { .. } => 0,
@@ -208,5 +211,8 @@ mod tests {
         assert_eq!(p.attr_size, 24);
         assert_eq!(p.fs, READ | write(9), "rights beyond the known ABI are not requested");
         assert!(Plan::new(0, None, None).is_none());
+        let sock = POp::Socket { src: c"/s".into() };
+        assert_eq!(Plan::new(9, None, None).unwrap().access(&sock, false), RESOLVE_UNIX);
+        assert_eq!(Plan::new(8, None, None).unwrap().access(&sock, false), 0, "nothing to grant before ABI 9");
     }
 }

@@ -1,8 +1,8 @@
 # Design note: GUI applications
 
-Status: proposal, 2026-11-05. Nothing here is implemented yet, apart
-from the prototype of the Wayland decision gate (1), run on sway and
-Hyprland on 2026-11-07 (it passes on both). Part of
+Status: proposal, 2026-11-05. Implemented so far: the prototype of the
+Wayland decision gate (1), run on sway and Hyprland on 2026-11-07 (it
+passes on both), and `fs.sockets` (2), on 2026-11-07. Part of
 the general-purpose direction in [ergonomics.md](ergonomics.md).
 
 ## Problem
@@ -187,6 +187,11 @@ connect to exactly that file:
   build-cache daemon), with a warning in the README that each socket is
   a capability handed to the program.
 
+Done on 2026-11-07: `vssb::Mount::socket` (`MountKind::Socket`), mounted
+read-only with a Landlock rule granting only the connect right, and
+`fs.sockets` / `--socket` in vssr. Before ABI 9 Landlock can't restrict
+unix sockets, so the entry is simply a bind there.
+
 ## 3. D-Bus only through a filter
 
 The sandbox never sees the session bus. vssr starts `xdg-dbus-proxy` (a
@@ -281,6 +286,7 @@ To explore (unverified):
    decides whether the rest is worth building on this compositor. Done
    on 2026-11-07: it passes on sway and Hyprland (see 1).
 1. `fs.sockets` with the Landlock connect right (2); useful headless too.
+   Done on 2026-11-07.
 2. Wayland through a security context, with the check at every start (1).
 3. `xdg-dbus-proxy` and `[dbus]` (3).
 4. Per-app home, environment, `XDG_RUNTIME_DIR`, fonts and themes; two
@@ -302,7 +308,8 @@ running:
 - Through the D-Bus proxy, `org.freedesktop.systemd1` can't be called;
   an allowed name can.
 - Only sockets listed in `fs.sockets` can be connected to; another
-  socket in the same directory can't.
+  socket in the same directory can't. (In place since 2026-11-07, in
+  both test suites.)
 - The security-context socket stops accepting once the sandbox exits.
 - `x11 = true` gives a working X server inside, and no X socket from the
   host is visible.
