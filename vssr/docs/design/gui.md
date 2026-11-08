@@ -1,8 +1,8 @@
 # Design note: GUI applications
 
 Status: proposal, 2026-11-05. Nothing here is implemented yet, apart
-from the prototype of the Wayland decision gate (1), run on sway on
-2026-11-07. Part of
+from the prototype of the Wayland decision gate (1), run on sway and
+Hyprland on 2026-11-07 (it passes on both). Part of
 the general-purpose direction in [ergonomics.md](ergonomics.md).
 
 ## Problem
@@ -108,7 +108,7 @@ to the compositor. Before building more, a prototype must connect
 through such a socket and list the globals it sees:
 
 - If Hyprland still offers screencopy, data control or virtual input
-  there, vssr refuses `wayland = true` on that compositor unless
+  there (it doesn't, see below), vssr refuses `wayland = true` on that compositor unless
   `insecure_wayland = true`, and says which protocols leak.
 - wlroots compositors (sway) reportedly hide privileged protocols from
   security-context clients; verify on the headless sway used for tests.
@@ -153,9 +153,25 @@ lists the globals through the new socket. Run against a headless sway
   and `sandbox_instance_id` set. Missing `zxdg_output_manager_v1` didn't
   bother either; check it again for the private Xwayland (4).
 
-Not yet checked: Hyprland. The prototype only ran on a headless
-compositor; Hyprland's part of the gate needs a Hyprland instance that
-isn't the live session (or an explicit decision to run it there).
+On Hyprland 0.57.1, the live session (by decision: a nested Hyprland
+can't run inside the headless sway, since its Wayland backend binds
+`xdg_wm_base` version 6 and sway 1.12 offers 5), with no permission
+settings in its configuration, the gate passes too, with the same
+behaviour for binding by name and for the close-fd:
+
+- A client through the listener sees 40 of 73 globals. Hidden, besides
+  the wlroots and ext protocols above: Hyprland's toplevel export,
+  global shortcuts, input capture, focus grab, CTM control, lock
+  notifier, toplevel mapping and workspace capture, the hotkey
+  protocols, pointer warp, DRM lease, content type and
+  `xwayland_shell_v1`.
+- Still visible: `ext_idle_notifier_v1`, and
+  `zwp_keyboard_shortcuts_inhibit_manager_v1` (a focused window can take
+  the compositor's own key bindings; not an escape, but worth a warning
+  in profiles that don't need it).
+- Hidden `xwayland_shell_v1` means the private Xwayland (4) must run
+  rootful or through `xwayland-satellite` there; check that when
+  building it.
 
 ## 2. Connecting to specific sockets (`fs.sockets`)
 
@@ -263,7 +279,7 @@ To explore (unverified):
 0. **Prototype the decision gate (1):** a security-context listener plus
    a global listing, against Hyprland and headless sway. About a day; it
    decides whether the rest is worth building on this compositor. Done
-   for sway on 2026-11-07 (it passes, see 1); Hyprland is still open.
+   on 2026-11-07: it passes on sway and Hyprland (see 1).
 1. `fs.sockets` with the Landlock connect right (2); useful headless too.
 2. Wayland through a security context, with the check at every start (1).
 3. `xdg-dbus-proxy` and `[dbus]` (3).
@@ -293,8 +309,6 @@ running:
 
 ## Open questions
 
-- Does Hyprland filter globals for security-context clients, and if not,
-  is its permission configuration enough to recommend?
 - Restricted PipeWire access without Flatpak's identification.
 - Whether the Flatpak-compatible info file (7) is robust enough to
   support, or too tied to portal internals.
