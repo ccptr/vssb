@@ -56,6 +56,9 @@ vssr run [OPTIONS] -- COMMAND [ARGS...]
       --rw PATH          expose read-write
       --tmpfs PATH       empty tmpfs
       --deny PATH        hide a path
+      --socket PATH      let the program connect to this host unix socket (SRC or SRC:DEST)
+      --wayland          a Wayland socket through a security context (see below)
+      --app-id ID        the app id the compositor gets (with --wayland)
       --net none|proxy|host
       --allow HOST       allow through the proxy (implies --net proxy)
       --timeout 30m      --memory 4G   --cpus 2   --pids 512
@@ -144,6 +147,11 @@ project = "ro"          # detected directories elsewhere in the same git reposit
 allow = ["ptrace"]      # take syscalls off the default deny list
 deny = ["kcmp", "nr:999"]
 
+[gui]
+wayland = true          # a Wayland socket through a security context
+app_id = "org.example.App"   # reported to the compositor
+insecure_wayland = false     # run even if capture, clipboard or input protocols stay visible
+
 [audit]
 log = "~/.local/state/vssr/audit.jsonl"
 quiet = false           # vssr's messages (notes, warnings, blocked requests) only in the log
@@ -209,6 +217,24 @@ file: a sandbox can't redirect the supervisor's writes elsewhere. The
 sandbox can still edit a log it can write to; keep it outside for a
 record the agent can't touch.
 
+**Wayland.** With `gui.wayland` (`--wayland`), vssr asks the session's
+compositor (`$WAYLAND_DISPLAY`) for a new listening socket through
+`wp_security_context_manager_v1`, as Flatpak does. The compositor knows
+clients on it are sandboxed and hides its privileged protocols from
+them. vssr then lists the globals offered there and refuses to start if
+any protocol for screen capture, the clipboard, input injection or
+reading other clients' input is among them (`insecure_wayland = true`
+runs anyway, with a warning). A compositor without security contexts is
+refused. Inside, the program gets a private `/run/user/<uid>` tmpfs
+holding only that socket as `wayland-0` (`WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR` are set to match), and the session's own socket is
+hidden wherever a bind would show it. The compositor sees the windows
+with sandbox engine `vssr`, the `app_id` and the run id. On the host the
+socket lives in `$XDG_RUNTIME_DIR/vssr/<id>/` and is removed when the
+run ends; the compositor stops accepting on it as soon as vssr exits.
+There is no X11 access (`DISPLAY` isn't passed, `/tmp` is fresh), no
+D-Bus and no audio yet.
+
 **Driving vssr from another program.** `--audit-fd N` writes the events
 to a descriptor the caller passed in (a pipe, socket or file), with no
 path the sandbox could redirect; the sandbox doesn't inherit it. Events
@@ -220,7 +246,8 @@ set) and `event`:
 | `note` | something detection left out, and why (`text`) |
 | `start` | the program has been exec'd: the ready event (`host_pid`, `limits`, …) |
 | `setup_failed` | the sandbox couldn't be set up or the program not run (`code`, `error`); no `start` follows |
-| `warning` | a limit isn't in effect (`limit`, `text`) |
+| `warning` | a limit isn't in effect (`limit`, `text`), or `insecure_wayland` let escape protocols through (`wayland_escapes`) |
+| `wayland` | the security context is in place (`compositor`, `app_id`, `globals` offered through it, `escapes`) |
 | `net`, `net_close` | each proxied connection: allowed, denied or failed, then its byte counts |
 | `signal` | a signal passed on to the program |
 | `timeout` | the timeout hit; SIGTERM, then SIGKILL after `kill_grace` |
@@ -291,6 +318,11 @@ Think about what you expose, not only what you block.
   sign with your keys (though not read them); a docker or systemd socket
   amounts to running commands on the host. The source must be a socket,
   and it is mounted read-only.
+- With `--wayland`, what stays hidden is up to the compositor: vssr only
+  checks the escape protocols it knows by name. On sway and Hyprland the
+  idle notifier (it tells the app when you are away) stays visible, and
+  on Hyprland the keyboard-shortcuts inhibitor too (a focused window can
+  take the compositor's key bindings).
 - `--tty` keeps your terminal attached so interactive tools work.
   TIOCSTI is blocked, but the agent can still print escape sequences to
   your terminal; prefer non-tty mode for unattended runs. Ctrl-C and
@@ -343,7 +375,10 @@ tests/integration.sh        # end-to-end checks of the guarantees above
 
 The integration tests need internet access for the proxy tests
 (`VSSR_TEST_OFFLINE=1` skips them) and a systemd user manager for the
-limit tests.
+limit tests. The Wayland tests run only with `VSSR_TEST_WAYLAND` naming
+a headless compositor's socket, never the live session's, for example a
+sway started with `WLR_BACKENDS=headless WLR_RENDERER=pixman sway -c
+/dev/null` (it takes the next free `wayland-N`).
 
 ## License
 

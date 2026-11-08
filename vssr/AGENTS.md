@@ -11,9 +11,10 @@ into a `vssb::Sandbox` and `vssb::Command`.
 
 ## Layout
 
-- `src/main.rs`: CLI, policy overrides, supervisor (spawns the sandbox,
-  serves the proxy, forwards signals from a signalfd, timeout, audit
-  events), all on one thread apart from the proxy's.
+- `src/main.rs`: CLI, policy overrides, supervisor (creates the Wayland
+  security context, spawns the sandbox, serves the proxy, forwards
+  signals from a signalfd, timeout, audit events), all on one thread
+  apart from the proxy's.
 - `src/policy.rs`: TOML policy and its resolution into a `Plan` (mount
   list as `vssb::Mount`s sorted parent-first, env, net, limits), and
   `Plan::sandbox`/`Plan::command`, which map it onto vssb.
@@ -65,7 +66,10 @@ into a `vssb::Sandbox` and `vssb::Command`.
 ## Testing
 
 `cargo test`, then `tests/integration.sh` (end-to-end; needs network for
-the proxy tests and a systemd user manager for the limit tests). Add an
+the proxy tests and a systemd user manager for the limit tests; the
+Wayland tests need `VSSR_TEST_WAYLAND` naming a headless compositor, and
+the script unsets `WAYLAND_DISPLAY` so nothing else reaches the live
+session). Add an
 integration test for every new guarantee; guarantees of the sandbox
 itself also get one in vssb's `tests/sandbox.rs`.
 

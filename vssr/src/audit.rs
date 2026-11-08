@@ -3,13 +3,13 @@
 //! concurrent runs can share one log. vssr's own messages are events too;
 //! `say` also prints them to stderr unless the run is quiet.
 
-use crate::util::resolve_guarded_prefix;
+use crate::util::make_dirs;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -87,53 +87,9 @@ fn os_err(what: &str) -> anyhow::Error {
     anyhow::Error::new(std::io::Error::last_os_error()).context(what.to_string())
 }
 
-/// openat2 with RESOLVE_NO_SYMLINKS, for a directory.
-fn open_dir(dirfd: libc::c_int, path: &[u8]) -> std::io::Result<OwnedFd> {
-    let c = CString::new(path)?;
-    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
-    how.resolve = libc::RESOLVE_NO_SYMLINKS;
-    let fd = unsafe { libc::syscall(libc::SYS_openat2, dirfd, c.as_ptr(), &how as *const libc::open_how, std::mem::size_of::<libc::open_how>()) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-}
-
-/// Opens the log's directory, creating what is missing. The part that
-/// exists is resolved with `resolve_guarded` and pinned; each missing
-/// component is then made with `mkdirat` and opened from its parent's
-/// descriptor without following a symlink, so a symlink planted on the
-/// way (by the sandbox, before or during this) is an error, never a
-/// place where directories get created.
-fn log_dir(parent: &Path, writable: &[PathBuf]) -> Result<OwnedFd> {
-    let (dir, missing) = resolve_guarded_prefix(parent, writable)?;
-    if let Some(i) = missing.iter().position(|c| c == "..") {
-        bail!("{}: \"..\" after the missing directory {}", parent.display(), dir.join(missing[0..i].iter().collect::<PathBuf>()).display());
-    }
-    // Pin the checked directory: a symlink swapped in since is an error.
-    let mut dfd = open_dir(libc::AT_FDCWD, dir.as_os_str().as_bytes()).with_context(|| format!("opening {}", dir.display()))?;
-    let mut at = dir;
-    for c in missing {
-        at.push(&c);
-        let cname = CString::new(c.as_bytes())?;
-        if unsafe { libc::mkdirat(dfd.as_raw_fd(), cname.as_ptr(), 0o777) } < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-            return Err(os_err(&format!("creating {}", at.display())));
-        }
-        dfd = match open_dir(dfd.as_raw_fd(), c.as_bytes()) {
-            Ok(fd) => fd,
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                bail!("{}: refusing to follow the symlink {} (the sandbox may have planted it)", parent.display(), at.display())
-            }
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {}", at.display()))),
-        };
-    }
-    Ok(dfd)
-}
-
 fn open_log(p: &Path, writable: &[PathBuf]) -> Result<File> {
     let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { bail!("not a file path") };
-    let dfd = log_dir(parent, writable)?;
+    let dfd = make_dirs(parent, writable, 0o777)?;
     // O_NOFOLLOW: no symlink as the log; O_NONBLOCK: a FIFO doesn't block the open.
     let cname = CString::new(name.as_bytes())?;
     let flags = libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -158,6 +114,7 @@ fn open_log(p: &Path, writable: &[PathBuf]) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::OwnedFd;
 
     fn base(name: &str) -> PathBuf {
         let b = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("vssr-audit-{name}-{}", std::process::id()));

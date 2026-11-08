@@ -20,7 +20,8 @@ README.md for the design and the guarantees towards the host program.
   failure records from the child and their messages. `src/cgroup.rs`:
   systemd scope over D-Bus (`ossteam-dbus`, from the ossteam checkout
   next to this one; a blocking call, no subprocess). `src/proxy.rs`:
-  filtering HTTP proxy.
+  filtering HTTP proxy. `src/wayland.rs`: Wayland security-context
+  listener, host side, by hand over the wire.
 
 ## Invariants
 
@@ -58,4 +59,6 @@ README.md for the design and the guarantees towards the host program.
 ## Testing
 
 `cargo test`. Add an end-to-end test in `tests/sandbox.rs` for every new
-guarantee. Tests run in parallel threads on purpose.
+guarantee. Tests run in parallel threads on purpose. Wayland tests talk
+only to the compositor `VSSB_TEST_WAYLAND` names (a headless one), never
+to the session's `$WAYLAND_DISPLAY`.

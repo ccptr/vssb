@@ -2,8 +2,12 @@
 # End-to-end checks of the sandbox's guarantees. Run after `cargo build`:
 #   tests/integration.sh [path/to/vssr]
 # Network tests need internet access and are skipped with VSSR_TEST_OFFLINE=1.
+# Wayland tests need a headless compositor with security contexts (sway),
+# named by VSSR_TEST_WAYLAND (e.g. wayland-2); never the live session's.
 # Resource-limit tests need a systemd user manager.
 set -u
+# Only the Wayland section talks to a compositor, and only to the test one.
+unset WAYLAND_DISPLAY
 
 V=${1:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/vssr}
 V=$(realpath "$V")
@@ -481,6 +485,27 @@ s=socket.socket(socket.AF_UNIX)
 try: s.connect("\0vssr-test-abstract"); print("connected")
 except OSError as e: print(e)'
 kill $lp 2>/dev/null
+
+echo "== wayland"
+if [ -n "${VSSR_TEST_WAYLAND:-}" ]; then
+    W=$VSSR_TEST_WAYLAND
+    export WAYLAND_DISPLAY=$W
+    out=$("$V" run --wayland -- wayland-info 2>&1)
+    if echo "$out" | grep -q "'wl_compositor'" && ! echo "$out" | grep -Eq "'(zwlr_screencopy|ext_image_copy_capture|zwlr_data_control|ext_data_control|zwp_virtual_keyboard|zwlr_virtual_pointer|zwp_input_method)_manager"; then
+        ok "a Wayland client inside sees no capture, clipboard or input globals"
+    else
+        bad "a Wayland client inside sees no capture, clipboard or input globals" "$(echo "$out" | tail -n 3 | tr '\n' ' ')"
+    fi
+    expect_out "  ...through a private runtime directory" "^wayland-0 /run/user/$(id -u)\$" -- run --wayland -- sh -c 'echo "$WAYLAND_DISPLAY $XDG_RUNTIME_DIR"'
+    expect_out "the session's socket is hidden where a bind shows it" '^hidden$' -- run --wayland --ro "$XDG_RUNTIME_DIR:/hostrun" -- sh -c "test -S /hostrun/$W && echo visible || echo hidden"
+    expect "a host runtime directory in the private one's place is refused" 125 -- run --wayland --ro "$XDG_RUNTIME_DIR" -- true
+    wid=wltest-$$
+    VSSR_ID=$wid "$V" run --wayland -- sh -c 'test -S "$XDG_RUNTIME_DIR/wayland-0"' >/dev/null 2>&1 && [ ! -e "$XDG_RUNTIME_DIR/vssr/$wid" ] && ok "the security-context socket is removed after the run" || bad "the security-context socket is removed after the run" "$(ls -la "$XDG_RUNTIME_DIR/vssr/$wid")"
+    WAYLAND_DISPLAY=vssr-test-none expect "no compositor is a setup error" 125 -- run --wayland -- true
+    unset WAYLAND_DISPLAY
+else
+    echo " skip wayland (set VSSR_TEST_WAYLAND to a headless compositor's socket)"
+fi
 
 echo "== resource limits"
 if "$V" check 2>/dev/null | grep -q '^ ok  resource limits'; then

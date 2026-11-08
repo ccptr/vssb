@@ -74,6 +74,11 @@ full.
   reads the policy from a pipe, `--pass-fd` hands the program a
   descriptor such as a pre-connected socket, and `--cgroup` uses a cgroup
   you prepared.
+- **Single sockets and Wayland.** `--socket` hands over one host unix
+  socket (an `ssh-agent`, a build daemon) and nothing else in its
+  directory. `--wayland` gives a GUI program a Wayland socket through a
+  security context, so the compositor hides screen capture, the clipboard
+  and input injection from it; vssr checks that it does before starting.
 
 ## Requirements
 
@@ -102,7 +107,9 @@ vssr/tests/integration.sh  # vssr end to end
 The integration script runs `target/debug/vssr` (or the binary given as
 its argument), so build first. It needs network access for the proxy tests
 (`VSSR_TEST_OFFLINE=1` skips them). Tests of limits through a systemd
-scope are skipped without a systemd user manager.
+scope are skipped without a systemd user manager. The Wayland tests run
+only with `VSSB_TEST_WAYLAND` / `VSSR_TEST_WAYLAND` naming a headless
+compositor's socket.
 
 ## Documentation
 

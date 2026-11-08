@@ -513,6 +513,46 @@ fn socket_entries_take_only_sockets() {
     assert_eq!(code(&sb, &d, "test ! -e /run/s"), 0);
 }
 
+/// The compositor the Wayland tests use: a headless one, named by
+/// VSSB_TEST_WAYLAND (a socket path, or a name in $XDG_RUNTIME_DIR). Never
+/// the live session's, so they are skipped without it.
+fn test_compositor() -> Option<PathBuf> {
+    let w = std::env::var("VSSB_TEST_WAYLAND").ok()?;
+    let p = Path::new(&w);
+    Some(if p.is_absolute() { p.to_path_buf() } else { Path::new(&std::env::var("XDG_RUNTIME_DIR").ok()?).join(p) })
+}
+
+#[test]
+fn wayland_through_a_security_context() {
+    use vssb::wayland::{Context, Options};
+    let Some(compositor) = test_compositor() else {
+        eprintln!("skipped: set VSSB_TEST_WAYLAND to a headless compositor's socket");
+        return;
+    };
+    let d = Dir::new();
+    let host = Dir::new();
+    let opts = Options { engine: "vssb-test".into(), app_id: Some("org.example.Test".into()), instance_id: Some("t1".into()) };
+    let ctx = Context::create(&compositor, &host.0.join("wayland-0"), &opts).unwrap();
+    assert!(ctx.globals().iter().any(|g| g == "wl_compositor"), "{:?}", ctx.globals());
+    assert_eq!(ctx.escapes(), Vec::<&str>::new(), "this compositor leaks privileged globals");
+    let inside = "/run/user/wl/wayland-0";
+    let mut sb = sandbox(&d);
+    sb.mount(Mount::socket_at(ctx.socket(), inside));
+    let mut c = Command::new("wayland-info");
+    c.env("WAYLAND_DISPLAY", inside).env("PATH", "/usr/bin:/bin").stdout(Stdio::Piped).stderr(Stdio::Piped);
+    let (s, out) = run(&sb, c);
+    assert!(s.success(), "{s}: {out}");
+    assert!(out.contains("wl_compositor"), "{out}");
+    for e in vssb::wayland::ESCAPES {
+        assert!(!out.contains(&format!("'{e}'")), "{e} visible inside: {out}");
+    }
+    // Dropped: the compositor stops accepting, and the socket is gone.
+    let socket = ctx.socket().to_path_buf();
+    drop(ctx);
+    assert!(!socket.exists());
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
+}
+
 // == syscalls
 
 #[test]

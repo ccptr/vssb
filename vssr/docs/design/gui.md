@@ -2,7 +2,8 @@
 
 Status: proposal, 2026-11-05. Implemented so far: the prototype of the
 Wayland decision gate (1), run on sway and Hyprland on 2026-11-07 (it
-passes on both), and `fs.sockets` (2), on 2026-11-07. Part of
+passes on both), then `fs.sockets` (2) and Wayland through a security
+context with the check at every start (1), both on 2026-11-07. Part of
 the general-purpose direction in [ergonomics.md](ergonomics.md).
 
 ## Problem
@@ -120,6 +121,25 @@ through such a socket and list the globals it sees:
 The check runs at every start: vssr lists the globals through the new
 socket and refuses (or warns, with `insecure_wayland`) if a privileged
 one appears. That check is also the main integration test.
+
+**Built (2026-11-07).** The protocol code is `vssb::wayland` (a
+host-side helper like `vssb::proxy`, so embedders get it too):
+`Context::create` binds the listener through the pinned directory,
+creates the context, lists the globals through it, and `escapes()`
+names those of `ESCAPES` still offered: the capture, data-control,
+virtual-input and input-method protocols, Hyprland's toplevel export
+and input capture, and the security-context manager itself. vssr's
+`[gui] wayland`, `app_id`, `insecure_wayland` (and `--wayland`,
+`--app-id`) put the socket at `$XDG_RUNTIME_DIR/vssr/<id>/wayland-0` on
+the host and, inside, in a private tmpfs at `/run/user/<uid>` as
+`wayland-0`, mounted with `Mount::socket_at`. The session's own socket
+gets a deny entry wherever a bind would show it, and a policy that maps
+a host directory onto `/run/user/<uid>` is refused. Differences from the
+sequence above: the socket is bound through `/proc/self/fd/<dir>`, so
+no symlink in its directory is followed, and it is removed after the run
+(not before: unlinking a mount point detaches it in the sandbox too).
+Through sway, `foot` inside opens a window that sway reports with
+`sandbox_engine: vssr`, the app id and the run id.
 
 **Prototype results (2026-11-07).** `vssr/examples/wayland-context.rs`
 does the sequence above by hand (about 300 lines over `libc`), then
@@ -288,6 +308,7 @@ To explore (unverified):
 1. `fs.sockets` with the Landlock connect right (2); useful headless too.
    Done on 2026-11-07.
 2. Wayland through a security context, with the check at every start (1).
+   Done on 2026-11-07.
 3. `xdg-dbus-proxy` and `[dbus]` (3).
 4. Per-app home, environment, `XDG_RUNTIME_DIR`, fonts and themes; two
    or three example profiles in `examples/` (6).
@@ -303,14 +324,18 @@ running:
 
 - A client inside sees no screencopy, data-control or virtual-input
   globals; vssr refuses to start where the compositor would leak them.
+  (In place since 2026-11-07, run with `VSSB_TEST_WAYLAND` /
+  `VSSR_TEST_WAYLAND`; the refusal itself only has a unit test, since
+  neither sway nor Hyprland leaks.)
 - The session's own Wayland socket and the session bus are unreachable
-  inside.
+  inside. (The Wayland half in place since 2026-11-07.)
 - Through the D-Bus proxy, `org.freedesktop.systemd1` can't be called;
   an allowed name can.
 - Only sockets listed in `fs.sockets` can be connected to; another
   socket in the same directory can't. (In place since 2026-11-07, in
   both test suites.)
 - The security-context socket stops accepting once the sandbox exits.
+  (In place since 2026-11-07.)
 - `x11 = true` gives a working X server inside, and no X socket from the
   host is visible.
 

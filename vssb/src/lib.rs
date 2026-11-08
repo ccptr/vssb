@@ -45,6 +45,8 @@ mod sys;
 
 #[cfg(feature = "proxy")]
 pub mod proxy;
+#[cfg(feature = "wayland")]
+pub mod wayland;
 
 pub use config::{
     Cgroup, Command, CpuChoice, CpuMethod, Enforcement, FreezeMethod, Limits, Mount, MountKind, Net, PidsMethod, Resource, Sandbox, Stdio,

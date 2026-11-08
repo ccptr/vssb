@@ -83,6 +83,14 @@ struct RunArgs {
     /// Let the program connect to this host unix socket (SRC or SRC:DEST)
     #[arg(long, value_name = "PATH")]
     socket: Vec<String>,
+    /// Give the program a Wayland socket through a security context, which
+    /// the compositor restricts (no screen capture, clipboard snooping or
+    /// input injection)
+    #[arg(long)]
+    wayland: bool,
+    /// The app id the compositor gets for the program's windows (with --wayland)
+    #[arg(long, value_name = "ID")]
+    app_id: Option<String>,
     /// Network mode
     #[arg(long, value_enum)]
     net: Option<NetArg>,
@@ -256,6 +264,12 @@ fn resolve(args: &RunArgs) -> Result<Plan> {
     if args.no_detect {
         p.detect.enable.clear();
     }
+    if args.wayland {
+        p.gui.wayland = true;
+    }
+    if args.app_id.is_some() {
+        p.gui.app_id = args.app_id.clone();
+    }
     p.detect.within.extend(args.detect_within.iter().cloned());
     p.detect.within_rw.extend(args.detect_within_rw.iter().cloned());
     if let Some(m) = args.detect_project {
@@ -367,12 +381,19 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
     }
     let sfd = unsafe { OwnedFd::from_raw_fd(sfd) };
 
+    // Kept until the sandbox has exited; dropping it stops the listener.
+    let wayland = plan.wayland.as_ref().map(|w| start_wayland(w, &plan.writable, id, audit)).transpose()?;
+
     let started = Instant::now();
     let mut cmd = plan.command(id);
     for (target, fd) in fds {
         cmd.pass_fd(target, fd);
     }
-    let mut child = match plan.sandbox().spawn(cmd) {
+    let mut sb = plan.sandbox();
+    if let (Some(w), Some(run)) = (&plan.wayland, &wayland) {
+        sb.mount(vssb::Mount::socket_at(run.ctx.socket(), w.socket()).no_symlinks());
+    }
+    let mut child = match sb.spawn(cmd) {
         Ok(c) => c,
         Err(e) => {
             let code = e.shell_code();
@@ -452,6 +473,61 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
     let code = if timed_out { EXIT_TIMEOUT } else { status.shell_code() };
     audit.event("exit", json!({"code": code, "timed_out": timed_out, "duration_ms": started.elapsed().as_millis() as u64}));
     Ok(code)
+}
+
+/// A security-context listener and the directory holding it,
+/// `$XDG_RUNTIME_DIR/vssr/<id>`, removed in that order when dropped.
+struct WaylandRun {
+    ctx: vssb::wayland::Context,
+    _dir: RunDir,
+}
+
+struct RunDir {
+    parent: OwnedFd,
+    name: std::ffi::CString,
+}
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), libc::AT_REMOVEDIR) };
+    }
+}
+
+/// Creates the security-context listener and refuses to go on if escape
+/// protocols are visible through it (unless the policy accepts that).
+fn start_wayland(w: &policy::WaylandPlan, writable: &[PathBuf], id: &str, audit: &Audit) -> Result<WaylandRun> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        bail!("invalid run id {id:?} (letters, digits, '-' and '_')");
+    }
+    let rt = std::env::var("XDG_RUNTIME_DIR").context("gui.wayland: $XDG_RUNTIME_DIR is not set")?;
+    let rt = std::fs::canonicalize(&rt).with_context(|| format!("$XDG_RUNTIME_DIR {rt}"))?;
+    let base = rt.join("vssr");
+    let parent = util::make_dirs(&base, writable, 0o700)?;
+    let name = std::ffi::CString::new(id)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+        bail!("creating {}: {}", base.join(id).display(), std::io::Error::last_os_error());
+    }
+    let dir = RunDir { parent, name };
+    let opts = vssb::wayland::Options { engine: "vssr".into(), app_id: w.app_id.clone(), instance_id: Some(id.into()) };
+    let ctx = vssb::wayland::Context::create(&w.compositor, &base.join(id).join("wayland-0"), &opts)
+        .map_err(|e| anyhow::anyhow!("gui.wayland: {e}"))?;
+    let escapes = ctx.escapes();
+    audit.event(
+        "wayland",
+        json!({"compositor": w.compositor, "app_id": w.app_id, "globals": ctx.globals(), "escapes": escapes}),
+    );
+    if !escapes.is_empty() {
+        let list = escapes.join(", ");
+        if !w.insecure {
+            bail!(
+                "the compositor still offers {list} to sandboxed clients, which would let the program capture the screen, \
+                 read the clipboard or inject input; set gui.insecure_wayland = true to run anyway"
+            );
+        }
+        let text = format!("insecure_wayland: the program can use {list}");
+        audit.say("warning", json!({"wayland_escapes": escapes, "text": text}), &format!("warning: {text}"));
+    }
+    Ok(WaylandRun { ctx, _dir: dir })
 }
 
 /// Passes pending signals on to the program (through the sandbox's PID 1).

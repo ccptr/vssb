@@ -64,6 +64,11 @@ project = "ro"         # detected directories elsewhere in the same git reposito
 allow = []             # remove syscalls from the default deny list, e.g. ["ptrace"]
 deny = []              # extra syscalls to deny
 
+[gui]
+wayland = false        # a Wayland socket through a security context, which the compositor restricts
+# app_id = "org.example.App"   # reported to the compositor
+# insecure_wayland = false     # run even if capture, clipboard or input protocols stay visible
+
 [audit]
 # log = "~/.local/state/vssr/audit.jsonl"
 quiet = false          # true: vssr's messages go only to the log, not to stderr
@@ -80,6 +85,7 @@ pub struct Policy {
     pub limits: LimitsCfg,
     pub detect: DetectCfg,
     pub seccomp: SeccompCfg,
+    pub gui: GuiCfg,
     pub audit: AuditCfg,
 }
 
@@ -296,6 +302,18 @@ pub struct SeccompCfg {
     pub deny: Vec<String>,
 }
 
+/// GUI applications (see docs/design/gui.md).
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct GuiCfg {
+    /// Reported to the compositor as the sandboxed clients' app id.
+    pub app_id: Option<String>,
+    /// A Wayland socket through a security context.
+    pub wayland: bool,
+    /// Run even when the compositor still offers escape protocols there.
+    pub insecure_wayland: bool,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuditCfg {
@@ -380,6 +398,77 @@ pub struct Plan {
     pub detected: BTreeMap<PathBuf, String>,
     /// Messages for the user from plan resolution (detection results).
     pub notes: Vec<String>,
+    pub wayland: Option<WaylandPlan>,
+}
+
+/// Wayland through a security context. The socket itself is made at start
+/// (`main.rs`), so it isn't among the plan's mounts.
+#[derive(Debug, Clone)]
+pub struct WaylandPlan {
+    /// The session compositor's socket, on the host.
+    pub compositor: PathBuf,
+    /// The private runtime directory inside (a tmpfs among the mounts),
+    /// which holds the socket as `wayland-0`.
+    pub runtime_dir: PathBuf,
+    pub app_id: Option<String>,
+    pub insecure: bool,
+}
+
+impl WaylandPlan {
+    /// Where the program finds the socket.
+    pub fn socket(&self) -> PathBuf {
+        self.runtime_dir.join("wayland-0")
+    }
+}
+
+/// The session's Wayland socket: `$WAYLAND_DISPLAY` (default `wayland-0`),
+/// in `$XDG_RUNTIME_DIR` unless it is an absolute path.
+fn session_wayland() -> Result<PathBuf> {
+    let name = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    if Path::new(&name).is_absolute() {
+        return Ok(PathBuf::from(name));
+    }
+    let rt = std::env::var("XDG_RUNTIME_DIR").context("gui.wayland: $XDG_RUNTIME_DIR is not set")?;
+    Ok(Path::new(&rt).join(name))
+}
+
+/// Adds what Wayland needs to the view: a private runtime directory, and
+/// the session's own socket hidden wherever a bind would show it.
+fn add_wayland(gui: &GuiCfg, uid: u32, compositor: PathBuf, mounts: &mut BTreeMap<PathBuf, Mount>) -> Result<WaylandPlan> {
+    let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+    // The deepest entry at or above it decides: only a fresh tmpfs (or
+    // nothing, the sandbox's own root) can hold the private directory.
+    let owner = mounts.iter().filter(|(d, _)| runtime_dir.starts_with(d)).max_by_key(|(d, _)| d.components().count());
+    if let Some((d, m)) = owner
+        && !matches!(m.kind, MountKind::Tmpfs { .. })
+    {
+        bail!(
+            "gui.wayland makes {} the program's private runtime directory, but the policy's entry for {} covers it; \
+             expose host sockets with fs.sockets instead",
+            runtime_dir.display(),
+            d.display()
+        );
+    }
+    let real = std::fs::canonicalize(&compositor).unwrap_or_else(|_| compositor.clone());
+    let mut denies = Vec::new();
+    for m in mounts.values() {
+        match &m.kind {
+            MountKind::Socket { src } if *src == real => {
+                bail!("fs.sockets hands over the session's Wayland socket {}, which gui.wayland replaces", real.display())
+            }
+            MountKind::Bind { src, .. } if real.starts_with(src) && real != *src => {
+                if let Ok(rel) = real.strip_prefix(src) {
+                    denies.push(m.dest.join(rel));
+                }
+            }
+            _ => {}
+        }
+    }
+    for d in denies {
+        mounts.entry(d.clone()).or_insert_with(|| Mount::deny(d));
+    }
+    mounts.entry(runtime_dir.clone()).or_insert_with(|| Mount::tmpfs(&runtime_dir));
+    Ok(WaylandPlan { compositor, runtime_dir, app_id: gui.app_id.clone(), insecure: gui.insecure_wayland })
 }
 
 /// Extra filesystem entries from the command line; they override the policy.
@@ -493,6 +582,16 @@ impl Plan {
             }
         }
 
+        let uid = policy.sandbox.uid.unwrap_or(host_uid);
+        let wayland = if policy.gui.wayland {
+            Some(add_wayland(&policy.gui, uid, session_wayland()?, &mut mounts)?)
+        } else {
+            if policy.gui.insecure_wayland || policy.gui.app_id.is_some() {
+                bail!("gui.app_id and gui.insecure_wayland only apply with gui.wayland = true");
+            }
+            None
+        };
+
         if mounts.keys().any(|d| d == Path::new("/")) {
             bail!("'/' cannot be bound directly; list the directories to expose instead");
         }
@@ -527,7 +626,13 @@ impl Plan {
             bail!("net.allow only applies to net.mode = \"proxy\" (it is {:?})", policy.net.mode);
         }
 
-        let env = build_env(policy, &home, cwd)?;
+        let mut env = build_env(policy, &home, cwd)?;
+        if let Some(w) = &wayland {
+            env.retain(|(k, _)| k != "WAYLAND_DISPLAY" && k != "XDG_RUNTIME_DIR");
+            env.push(("WAYLAND_DISPLAY".into(), "wayland-0".into()));
+            env.push(("XDG_RUNTIME_DIR".into(), w.runtime_dir.to_string_lossy().into_owned()));
+            env.sort();
+        }
 
         let limits = &policy.limits;
         if let Some(c) = limits.cpus
@@ -541,7 +646,7 @@ impl Plan {
             cwd: cwd_inside,
             env,
             hostname: policy.sandbox.hostname.clone(),
-            uid: policy.sandbox.uid.unwrap_or(host_uid),
+            uid,
             gid: policy.sandbox.gid.unwrap_or(host_gid),
             host_uid,
             host_gid,
@@ -587,6 +692,7 @@ impl Plan {
             writable,
             detected,
             notes,
+            wayland,
         })
     }
 
@@ -731,6 +837,14 @@ impl Plan {
             "tty": self.tty,
             "audit_log": self.audit_log,
             "quiet": self.quiet,
+            "gui": {
+                "wayland": self.wayland.as_ref().map(|w| json!({
+                    "compositor": w.compositor,
+                    "socket": w.socket(),
+                    "app_id": w.app_id,
+                    "insecure": w.insecure,
+                })),
+            },
             "notes": self.notes,
         })
     }
@@ -772,6 +886,11 @@ impl Plan {
         }
         if let Some(p) = &self.tcp_bind {
             let _ = writeln!(s, "          tcp bind ports: {p:?}");
+        }
+        if let Some(w) = &self.wayland {
+            let app = w.app_id.as_deref().map(|a| format!(", app id {a}")).unwrap_or_default();
+            let insecure = if w.insecure { " (insecure_wayland: runs even if escape protocols are visible)" } else { "" };
+            let _ = writeln!(s, "wayland:  {} through a security context{app}, as {}{insecure}", w.compositor.display(), w.socket().display());
         }
         let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
         let _ = writeln!(s, "env:      {}", names.join(" "));
@@ -1106,6 +1225,32 @@ mod tests {
         // A deny entry still wins.
         let plan = plan_with(&base, "real/work", &[(FsKind::Rw, "@/real/work"), (FsKind::Socket, "@/real/s"), (FsKind::Deny, "@/real/s")]).unwrap();
         assert!(plan.mounts.iter().any(|m| m.dest == base.join("real/s") && m.kind == MountKind::Deny));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn wayland_view() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("vssr-wl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("rt")).unwrap();
+        let session = base.join("rt/wayland-1");
+        let _l = std::os::unix::net::UnixListener::bind(&session).unwrap();
+        let gui = GuiCfg { wayland: true, ..Default::default() };
+        let view = |entries: &[Mount]| {
+            let mut m: BTreeMap<PathBuf, Mount> = entries.iter().map(|e| (e.dest.clone(), e.clone())).collect();
+            add_wayland(&gui, 1000, session.clone(), &mut m).map(|w| (w, m))
+        };
+        // A private runtime directory, on the sandbox's own /run.
+        let (w, m) = view(&[Mount::tmpfs("/run")]).unwrap();
+        assert_eq!(w.socket(), Path::new("/run/user/1000/wayland-0"));
+        assert!(matches!(m[Path::new("/run/user/1000")].kind, MountKind::Tmpfs { .. }));
+        // The session's socket is hidden wherever a bind shows it.
+        let (_, m) = view(&[Mount::ro_at(base.join("rt"), "/hostrun")]).unwrap();
+        assert_eq!(m[Path::new("/hostrun/wayland-1")].kind, MountKind::Deny);
+        // A host directory where the private one goes, or the socket itself, is refused.
+        assert!(view(&[Mount::ro("/run")]).is_err());
+        assert!(view(&[Mount::ro_at(base.join("rt"), "/run/user/1000")]).is_err());
+        assert!(view(&[Mount::socket_at(&session, "/s")]).is_err());
         std::fs::remove_dir_all(&base).unwrap();
     }
 

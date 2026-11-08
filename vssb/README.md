@@ -126,6 +126,12 @@ are the guarantees towards the host, each with an integration test in
   on a listener from `listen_tcp`. It reports allow, deny and close events
   through a callback and stops cleanly. It is the only part that starts
   threads.
+- `wayland` (feature, on by default): `wayland::Context::create` makes a
+  Wayland security-context listener on the host (by hand over the wire,
+  no Wayland library, no threads) and lists the globals offered through
+  it; `escapes()` names any screen-capture, clipboard or input protocol
+  among them, so the caller can refuse. Mount `socket()` with
+  `Mount::socket_at`; dropping the context stops the listener.
 
 ## Not here (they are in vssr)
 
@@ -181,7 +187,9 @@ The end-to-end tests need `sh`, `bash`, `python3` and `curl` on the host,
 and run sandboxes on many threads at once. The limit and freeze tests
 through a systemd scope are skipped without a systemd user manager; the
 fallback tests always run (the pids one is skipped on kernels without a
-per-namespace `pid_max`). They don't need internet access.
+per-namespace `pid_max`). They don't need internet access. The Wayland
+test runs only with `VSSB_TEST_WAYLAND` naming a headless compositor's
+socket (see vssr's README), never the live session's.
 
 ## License
 
