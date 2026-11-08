@@ -1,4 +1,4 @@
-# vssd: notes for agents
+# dbus-proxy: notes for agents
 
 Filtering D-Bus proxy, as a library (vssr's `--dbus`). See README.md for
 the policy model, what passes, and how it differs from xdg-dbus-proxy.
@@ -40,7 +40,7 @@ the policy model, what passes, and how it differs from xdg-dbus-proxy.
 
 ## Testing
 
-`cargo test -p vssd`. Every filter rule gets a case in `filter::tests`;
+`cargo test -p dbus-proxy`. Every filter rule gets a case in `filter::tests`;
 anything that depends on a real client library or bus gets one in
 `tests/proxy.rs`. Tests use only their private `dbus-daemon`, never the
 session bus; try the session bus by hand only read-only (the example

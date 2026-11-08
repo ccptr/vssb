@@ -155,7 +155,7 @@ app_id = "org.example.App"   # reported to the compositor
 insecure_wayland = false     # run even if capture, clipboard or input protocols stay visible
 
 [dbus]
-session = true          # the session bus, through vssr's filter (vssd)
+session = true          # the session bus, through vssr's filter (dbus-proxy)
 talk = ["org.freedesktop.Notifications"]   # names it may call; "org.example.*" for a prefix
 own = ["org.example.App"]                  # names it may own
 see = []                # names it may only see
@@ -248,14 +248,14 @@ audio yet.
 **D-Bus.** The sandbox never sees the session bus itself. With
 `dbus.session` (`--dbus`, or any of `--dbus-talk`, `--dbus-own`,
 `--dbus-see`), vssr serves the program's bus itself, outside the
-sandbox, through [vssd](../vssd)'s filter, connected to the bus at
+sandbox, through [dbus-proxy](../dbus-proxy)'s filter, connected to the bus at
 `$DBUS_SESSION_BUS_ADDRESS` (default `$XDG_RUNTIME_DIR/bus`). The
 `[dbus]` lists mean what xdg-dbus-proxy's `--talk`, `--own`, `--see`,
 `--call` and `--broadcast` mean, as in Flatpak. Names the filter doesn't
 let through don't exist as far as the program can tell: calls to them
 fail as if no one owned them, and they are left out of `ListNames`. The
 program can always talk to the bus itself (eavesdropping and monitoring
-excepted); nothing at all is the filter with empty lists. vssd's README
+excepted); nothing at all is the filter with empty lists. dbus-proxy's README
 lists what passes. Inside it gets a private
 `/run/user/<uid>` tmpfs (shared with Wayland's) holding the proxy's
 socket as `bus`, with `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
@@ -375,7 +375,7 @@ Think about what you expose, not only what you block.
   access to the session bus, so a flaw in it would hand the program the
   whole bus. It parses and checks every header at least as strictly as
   dbus-daemon before deciding, and refuses what it doesn't know (see
-  vssd's README).
+  dbus-proxy's README).
 - `--tty` keeps your terminal attached so interactive tools work.
   TIOCSTI is blocked, but the agent can still print escape sequences to
   your terminal; prefer non-tty mode for unattended runs. Ctrl-C and

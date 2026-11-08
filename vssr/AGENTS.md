@@ -8,7 +8,7 @@ vssr is the front end; the sandbox itself is
 the namespaces, mounts, Landlock, seccomp and cgroup scope. Changes to
 how the sandbox is built, and their tests, go there; vssr turns policy
 into a `vssb::Sandbox` and `vssb::Command`. The D-Bus filter is
-[vssd](../vssd), likewise: vssr turns `[dbus]` into a `vssd::Policy` and
+[dbus-proxy](../dbus-proxy), likewise: vssr turns `[dbus]` into a `dbus_proxy::Policy` and
 its events into audit events.
 
 ## Layout
@@ -80,7 +80,7 @@ the proxy tests and a systemd user manager for the limit tests; the
 Wayland tests need `VSSR_TEST_WAYLAND` naming a headless compositor, and
 the script unsets `WAYLAND_DISPLAY` so nothing else reaches the live
 session; the D-Bus tests start their own bus, and make only a read-only
-call to the session bus). The D-Bus filter's own tests are vssd's. Add an
+call to the session bus). The D-Bus filter's own tests are dbus-proxy's. Add an
 integration test for every new guarantee; guarantees of the sandbox
 itself also get one in vssb's `tests/sandbox.rs`.
 

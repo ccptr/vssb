@@ -38,7 +38,7 @@ struct Bus {
 
 impl Bus {
     fn start(name: &str) -> Bus {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vssd-{name}-{}", std::process::id()));
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("dbus-proxy-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("bus");
@@ -120,17 +120,17 @@ fn run_env(argv: &[&str], env: &[(&str, &str)]) -> Output {
 
 struct Proxied {
     address: String,
-    events: Arc<Mutex<Vec<vssd::Event>>>,
-    proxy: Option<vssd::Proxy>,
+    events: Arc<Mutex<Vec<dbus_proxy::Event>>>,
+    proxy: Option<dbus_proxy::Proxy>,
 }
 
 impl Proxied {
-    fn new(bus: &Bus, name: &str, policy: vssd::Policy) -> Proxied {
+    fn new(bus: &Bus, name: &str, policy: dbus_proxy::Policy) -> Proxied {
         let socket = bus.dir.join(name);
         let listener = UnixListener::bind(&socket).unwrap();
         let events = Arc::new(Mutex::new(vec![]));
         let e = events.clone();
-        let proxy = vssd::serve(listener, &bus.address, policy, move |ev| e.lock().unwrap().push(ev.clone())).unwrap();
+        let proxy = dbus_proxy::serve(listener, &bus.address, policy, move |ev| e.lock().unwrap().push(ev.clone())).unwrap();
         Proxied { address: format!("unix:path={}", socket.display()), events, proxy: Some(proxy) }
     }
 
@@ -140,7 +140,7 @@ impl Proxied {
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                vssd::Event::Deny { denied, .. } => Some(denied.to_string()),
+                dbus_proxy::Event::Deny { denied, .. } => Some(denied.to_string()),
                 _ => None,
             })
             .collect()
@@ -151,9 +151,9 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-fn policy() -> vssd::Policy {
-    let mut p = vssd::Policy::new();
-    p.talk("org.vssd.Allowed").unwrap().see("org.vssd.Seen").unwrap().own("org.vssd.Mine.*").unwrap();
+fn policy() -> dbus_proxy::Policy {
+    let mut p = dbus_proxy::Policy::new();
+    p.talk("org.dbusproxy.Allowed").unwrap().see("org.dbusproxy.Seen").unwrap().own("org.dbusproxy.Mine.*").unwrap();
     p
 }
 
@@ -167,29 +167,29 @@ fn talk_see_hide_and_own() {
         return;
     }
     let mut bus = Bus::start("names");
-    for n in ["org.vssd.Allowed", "org.vssd.Other", "org.vssd.Seen"] {
+    for n in ["org.dbusproxy.Allowed", "org.dbusproxy.Other", "org.dbusproxy.Seen"] {
         bus.echo(n);
     }
     let p = Proxied::new(&bus, "proxy", policy());
     let a = p.address.as_str();
 
     // GDBus, libdbus and sd-bus all log in and make calls through it.
-    let o = run(&["gdbus", "call", "-a", a, "-d", "org.vssd.Allowed", "-o", "/", "-m", "org.vssd.Allowed.Hi"]);
+    let o = run(&["gdbus", "call", "-a", a, "-d", "org.dbusproxy.Allowed", "-o", "/", "-m", "org.dbusproxy.Allowed.Hi"]);
     assert!(o.status.success(), "gdbus: {}", stderr(&o));
-    let o = run(&["dbus-send", &format!("--bus={a}"), "--print-reply", "--dest=org.vssd.Allowed", "/", "org.vssd.Allowed.Hi"]);
+    let o = run(&["dbus-send", &format!("--bus={a}"), "--print-reply", "--dest=org.dbusproxy.Allowed", "/", "org.dbusproxy.Allowed.Hi"]);
     assert!(o.status.success(), "dbus-send: {}", stderr(&o));
-    let o = run(&["busctl", &format!("--address={a}"), "call", "org.vssd.Allowed", "/", "org.vssd.Allowed", "Hi"]);
+    let o = run(&["busctl", &format!("--address={a}"), "call", "org.dbusproxy.Allowed", "/", "org.dbusproxy.Allowed", "Hi"]);
     assert!(o.status.success(), "busctl: {}", stderr(&o));
 
     // Hidden: as if nothing owned it. Seen: there, but not callable.
-    let o = run(&["dbus-send", &format!("--bus={a}"), "--print-reply", "--dest=org.vssd.Other", "/", "org.vssd.Other.Hi"]);
+    let o = run(&["dbus-send", &format!("--bus={a}"), "--print-reply", "--dest=org.dbusproxy.Other", "/", "org.dbusproxy.Other.Hi"]);
     assert!(!o.status.success() && stderr(&o).contains("ServiceUnknown"), "{}", stderr(&o));
-    let o = run(&["busctl", &format!("--address={a}"), "call", "org.vssd.Seen", "/", "org.vssd.Seen", "Hi"]);
+    let o = run(&["busctl", &format!("--address={a}"), "call", "org.dbusproxy.Seen", "/", "org.dbusproxy.Seen", "Hi"]);
     assert!(!o.status.success() && (stderr(&o).contains("Access denied") || stderr(&o).contains("AccessDenied")), "{}", stderr(&o));
 
     let names = bus.names(a);
-    assert!(names.iter().any(|n| n == "org.vssd.Allowed") && names.iter().any(|n| n == "org.vssd.Seen"), "{names:?}");
-    assert!(!names.iter().any(|n| n == "org.vssd.Other"), "{names:?}");
+    assert!(names.iter().any(|n| n == "org.dbusproxy.Allowed") && names.iter().any(|n| n == "org.dbusproxy.Seen"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "org.dbusproxy.Other"), "{names:?}");
     // The program sees the unique names of the visible ones, not the others'.
     let uniques: Vec<&String> = names.iter().filter(|n| n.starts_with(':')).collect();
     assert_eq!(uniques.len(), 3, "the two services and itself: {names:?}");
@@ -199,28 +199,28 @@ fn talk_see_hide_and_own() {
         let o = run(&["busctl", &format!("--address={}", bus.address), "call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", name]);
         String::from_utf8_lossy(&o.stdout).split('"').nth(1).unwrap().to_string()
     };
-    let o = run(&["gdbus", "call", "-a", a, "-d", &owner("org.vssd.Allowed"), "-o", "/", "-m", "org.vssd.Allowed.Hi"]);
+    let o = run(&["gdbus", "call", "-a", a, "-d", &owner("org.dbusproxy.Allowed"), "-o", "/", "-m", "org.dbusproxy.Allowed.Hi"]);
     assert!(o.status.success(), "{}", stderr(&o));
-    let o = run(&["gdbus", "call", "-a", a, "-d", &owner("org.vssd.Other"), "-o", "/", "-m", "org.vssd.Other.Hi"]);
+    let o = run(&["gdbus", "call", "-a", a, "-d", &owner("org.dbusproxy.Other"), "-o", "/", "-m", "org.dbusproxy.Other.Hi"]);
     assert!(!o.status.success() && stderr(&o).contains("NameHasNoOwner"), "{}", stderr(&o));
 
-    // Owning: a name under org.vssd.Mine.* yes, anything else no.
+    // Owning: a name under org.dbusproxy.Mine.* yes, anything else no.
     let own = |name: &str| run_env(&["dbus-test-tool", "black-hole", &format!("--name={name}")], &[("DBUS_SESSION_BUS_ADDRESS", a)]);
-    let mut mine = Command::new("dbus-test-tool").args(["echo", "--name=org.vssd.Mine.App"]).env("DBUS_SESSION_BUS_ADDRESS", a).spawn().unwrap();
-    bus.wait_for("org.vssd.Mine.App");
+    let mut mine = Command::new("dbus-test-tool").args(["echo", "--name=org.dbusproxy.Mine.App"]).env("DBUS_SESSION_BUS_ADDRESS", a).spawn().unwrap();
+    bus.wait_for("org.dbusproxy.Mine.App");
     // And other programs on the bus reach it, under that name.
-    let o = run(&["busctl", &format!("--address={}", bus.address), "call", "org.vssd.Mine.App", "/", "org.vssd.X", "Hi"]);
+    let o = run(&["busctl", &format!("--address={}", bus.address), "call", "org.dbusproxy.Mine.App", "/", "org.dbusproxy.X", "Hi"]);
     assert!(o.status.success(), "calling the program's name: {}", stderr(&o));
     let _ = mine.kill();
     let _ = mine.wait();
-    let o = own("org.vssd.Allowed2");
+    let o = own("org.dbusproxy.Allowed2");
     assert!(!o.status.success() && stderr(&o).contains("failed to take bus name"), "{}", stderr(&o));
 
     let denied = p.denied();
     for want in [
-        "call org.vssd.Other.Hi to org.vssd.Other at /: name not visible",
-        "call org.vssd.Seen.Hi to org.vssd.Seen at /: not allowed",
-        "call org.freedesktop.DBus.RequestName(org.vssd.Allowed2) to org.freedesktop.DBus at /org/freedesktop/DBus: may not own the name",
+        "call org.dbusproxy.Other.Hi to org.dbusproxy.Other at /: name not visible",
+        "call org.dbusproxy.Seen.Hi to org.dbusproxy.Seen at /: not allowed",
+        "call org.freedesktop.DBus.RequestName(org.dbusproxy.Allowed2) to org.freedesktop.DBus at /org/freedesktop/DBus: may not own the name",
     ] {
         assert!(denied.iter().any(|d| d == want), "{want:?} not in {denied:#?}");
     }
@@ -251,7 +251,7 @@ fn descriptors_and_broadcasts() {
     let mut bus = Bus::start("fds");
     let mut svc = Command::new("python3")
         .arg(&peer)
-        .args(["service", "org.vssd.Peer"])
+        .args(["service", "org.dbusproxy.Peer"])
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .stdout(Stdio::piped())
         .spawn()
@@ -260,13 +260,13 @@ fn descriptors_and_broadcasts() {
     BufReader::new(svc.stdout.take().unwrap()).read_line(&mut line).unwrap();
     assert_eq!(line.trim(), "ready");
     bus.procs.0.push(svc);
-    let mut p = vssd::Policy::new();
-    p.talk("org.vssd.Peer").unwrap();
+    let mut p = dbus_proxy::Policy::new();
+    p.talk("org.dbusproxy.Peer").unwrap();
     let p = Proxied::new(&bus, "proxy", p);
     let o = run_env(&["python3", peer.to_str().unwrap(), "client", &bus.address], &[("DBUS_SESSION_BUS_ADDRESS", &p.address)]);
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "{out}{}", stderr(&o));
-    assert_eq!(out, "take taken\npipe from-service\nsignals org.vssd.Peer.Changed\n");
+    assert_eq!(out, "take taken\npipe from-service\nsignals org.dbusproxy.Peer.Changed\n");
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn probe() {
         return;
     }
     let bus = Bus::start("probe");
-    vssd::probe(&bus.address).unwrap();
-    assert!(vssd::probe(&format!("unix:path={}", bus.dir.join("nothing").display())).is_err());
-    assert!(vssd::probe("tcp:host=localhost,port=1").is_err());
+    dbus_proxy::probe(&bus.address).unwrap();
+    assert!(dbus_proxy::probe(&format!("unix:path={}", bus.dir.join("nothing").display())).is_err());
+    assert!(dbus_proxy::probe("tcp:host=localhost,port=1").is_err());
 }

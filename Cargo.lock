@@ -111,6 +111,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "dbus-proxy"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,24 +358,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "vssd"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "vssr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dbus-proxy",
  "libc",
  "serde",
  "serde_json",
  "toml",
  "vssb",
- "vssd",
 ]
 
 [[package]]

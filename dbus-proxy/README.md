@@ -1,4 +1,4 @@
-# vssd
+# dbus-proxy
 
 A filtering D-Bus proxy, as a library: it gives a sandboxed program a
 session bus that reaches only the names its policy allows, and reports
@@ -6,18 +6,18 @@ every message it stops. vssr uses it for `--dbus`; any program that
 sandboxes another can embed it.
 
 ```rust
-let mut policy = vssd::Policy::new();
+let mut policy = dbus_proxy::Policy::new();
 policy.talk("org.freedesktop.Notifications")?.own("org.example.App")?;
 let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")?;
-vssd::probe(&address)?;                       // fail now if there is no bus
+dbus_proxy::probe(&address)?;                       // fail now if there is no bus
 let listener = UnixListener::bind(&socket)?;  // where the program finds it
-let proxy = vssd::serve(listener, &address, policy, |e| eprintln!("{e}"))?;
+let proxy = dbus_proxy::serve(listener, &address, policy, |e| eprintln!("{e}"))?;
 // run the program with DBUS_SESSION_BUS_ADDRESS=unix:path=<socket>
 drop(proxy);                                  // closes every connection
 ```
 
 `examples/proxy.rs` runs it by hand with xdg-dbus-proxy's arguments
-(`cargo run -p vssd --example proxy -- "$DBUS_SESSION_BUS_ADDRESS" /tmp/bus --talk=…`).
+(`cargo run -p dbus-proxy --example proxy -- "$DBUS_SESSION_BUS_ADDRESS" /tmp/bus --talk=…`).
 
 ## The policy
 
@@ -126,7 +126,7 @@ MiB drops the connection. Each login may take 10 seconds.
 
 ## Tests
 
-`cargo test -p vssd`: unit tests of the wire format, the policy, the login
+`cargo test -p dbus-proxy`: unit tests of the wire format, the policy, the login
 and the filter (as a state machine, message by message), and
 `tests/proxy.rs`, which starts a private `dbus-daemon` with
 `dbus-test-tool` services and runs GDBus (`gdbus`, and Python's GIO for

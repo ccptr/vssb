@@ -629,7 +629,7 @@ fn start_wayland(w: &policy::WaylandPlan, dir: &RunDir, id: &str, audit: &Audit)
 /// The running D-Bus filter. Dropping it stops the proxy (closing every
 /// connection) and removes its socket.
 struct DbusProxy {
-    proxy: Option<vssd::Proxy>,
+    proxy: Option<dbus_proxy::Proxy>,
     socket: PathBuf,
     dir: OwnedFd,
 }
@@ -645,7 +645,7 @@ impl Drop for DbusProxy {
 /// login. Its threads (one to accept, one per connection) report to the
 /// audit log.
 fn start_dbus(d: &policy::DbusPlan, dir: &RunDir, audit: &Arc<Audit>) -> Result<DbusProxy> {
-    vssd::probe(&d.upstream).map_err(|e| anyhow::anyhow!("dbus.session: the session bus at {}: {e}", d.upstream))?;
+    dbus_proxy::probe(&d.upstream).map_err(|e| anyhow::anyhow!("dbus.session: the session bus at {}: {e}", d.upstream))?;
     let dir_fd = dir.fd.try_clone().context("duplicating the run directory")?;
     // Bound through the directory descriptor, so no symlink on the way is
     // followed.
@@ -655,7 +655,7 @@ fn start_dbus(d: &policy::DbusPlan, dir: &RunDir, audit: &Arc<Audit>) -> Result<
     let mut proxy = DbusProxy { proxy: None, socket: dir.path.join("bus"), dir: dir_fd };
     let a = audit.clone();
     let shown = std::sync::Mutex::new(std::collections::HashSet::new());
-    let served = vssd::serve(listener, &d.upstream, d.policy.clone(), move |e| dbus_event(&a, &shown, e));
+    let served = dbus_proxy::serve(listener, &d.upstream, d.policy.clone(), move |e| dbus_event(&a, &shown, e));
     proxy.proxy = Some(served.context("dbus.session: starting the filter")?);
     audit.event("dbus", json!({"upstream": d.upstream, "socket": d.socket(), "rules": d.rules}));
     Ok(proxy)
@@ -663,11 +663,11 @@ fn start_dbus(d: &policy::DbusPlan, dir: &RunDir, audit: &Arc<Audit>) -> Result<
 
 /// Logs what the D-Bus filter did. Each kind of blocked message is also
 /// shown once (programs often retry, or probe for many services).
-fn dbus_event(audit: &Audit, shown: &std::sync::Mutex<std::collections::HashSet<String>>, e: &vssd::Event) {
+fn dbus_event(audit: &Audit, shown: &std::sync::Mutex<std::collections::HashSet<String>>, e: &dbus_proxy::Event) {
     match e {
-        vssd::Event::Connect { conn, unique } => audit.event("dbus_connect", json!({"conn": conn, "unique": unique})),
-        vssd::Event::Close { conn, error } => audit.event("dbus_close", json!({"conn": conn, "error": error})),
-        vssd::Event::Deny { conn, denied } => {
+        dbus_proxy::Event::Connect { conn, unique } => audit.event("dbus_connect", json!({"conn": conn, "unique": unique})),
+        dbus_proxy::Event::Close { conn, error } => audit.event("dbus_close", json!({"conn": conn, "error": error})),
+        dbus_proxy::Event::Deny { conn, denied } => {
             let fields = json!({
                 "action": "deny",
                 "conn": conn,

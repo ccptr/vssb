@@ -13,7 +13,7 @@ This workspace holds three crates:
   another program (a game launcher, an agent harness, a build tool). It is
   safe to start from any thread and leaves no process-wide state behind.
   vssr is built on it.
-- [**vssd**](vssd): a filtering D-Bus proxy as a library: it gives a
+- [**dbus-proxy**](dbus-proxy): a filtering D-Bus proxy as a library: it gives a
   sandboxed program a session bus that reaches only the names its policy
   allows (xdg-dbus-proxy's rules), and reports what it stops. vssr uses it
   for `--dbus`.
@@ -83,7 +83,7 @@ full.
   directory. `--wayland` gives a GUI program a Wayland socket through a
   security context, so the compositor hides screen capture, the clipboard
   and input injection from it; vssr checks that it does before starting.
-  `--dbus-talk NAME` gives it the session bus through vssd's filter,
+  `--dbus-talk NAME` gives it the session bus through dbus-proxy's filter,
   which lets it reach only the names it is allowed and logs every call it
   blocks.
 
@@ -117,7 +117,7 @@ its argument), so build first. It needs network access for the proxy tests
 scope are skipped without a systemd user manager. The Wayland tests run
 only with `VSSB_TEST_WAYLAND` / `VSSR_TEST_WAYLAND` naming a headless
 compositor's socket. The D-Bus tests start a private bus (they need
-`dbus-daemon`, `dbus-test-tool` and `dbus-send`; vssd's also `gdbus`,
+`dbus-daemon`, `dbus-test-tool` and `dbus-send`; dbus-proxy's also `gdbus`,
 `busctl` and Python's GIO), apart from one read-only call to the session
 bus's systemd.
 
@@ -127,7 +127,7 @@ bus's systemd.
   audit events and security notes.
 - [`vssb/README.md`](vssb/README.md): the library API and what makes it
   embeddable.
-- [`vssd/README.md`](vssd/README.md): the D-Bus filter's policy model,
+- [`dbus-proxy/README.md`](dbus-proxy/README.md): the D-Bus filter's policy model,
   what passes, and how it differs from xdg-dbus-proxy.
 - [`vssr/docs/design/`](vssr/docs/design): proposals not implemented yet
   (ergonomics, GUI applications, embedding).

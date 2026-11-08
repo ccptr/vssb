@@ -1,7 +1,7 @@
 //! Runs the proxy by hand, with xdg-dbus-proxy's rule syntax:
 //!
 //! ```sh
-//! cargo run -p vssd --example proxy -- "$DBUS_SESSION_BUS_ADDRESS" /tmp/bus --talk=org.freedesktop.Notifications
+//! cargo run -p dbus-proxy --example proxy -- "$DBUS_SESSION_BUS_ADDRESS" /tmp/bus --talk=org.freedesktop.Notifications
 //! DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/bus notify-send hi
 //! ```
 //!
@@ -12,13 +12,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [address, socket, rules @ ..] = args.as_slice() else {
         return Err("usage: proxy ADDRESS SOCKET [--see|--talk|--own=NAME] [--call|--broadcast=NAME=RULE]...".into());
     };
-    let mut policy = vssd::Policy::new();
+    let mut policy = dbus_proxy::Policy::new();
     for r in rules {
         policy.add(r)?;
     }
-    vssd::probe(address)?;
+    dbus_proxy::probe(address)?;
     let listener = std::os::unix::net::UnixListener::bind(socket)?;
-    let proxy = vssd::serve(listener, address, policy, |e| eprintln!("{e}"))?;
+    let proxy = dbus_proxy::serve(listener, address, policy, |e| eprintln!("{e}"))?;
     eprintln!("listening on unix:path={socket}");
     std::io::copy(&mut std::io::stdin(), &mut std::io::sink())?;
     drop(proxy);

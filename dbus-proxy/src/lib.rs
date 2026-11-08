@@ -13,12 +13,12 @@
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut policy = vssd::Policy::new();
+//! let mut policy = dbus_proxy::Policy::new();
 //! policy.talk("org.freedesktop.Notifications")?.own("org.example.App")?;
 //! let listener = std::os::unix::net::UnixListener::bind("/run/user/1000/app/bus")?;
 //! let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")?;
-//! vssd::probe(&address)?;
-//! let proxy = vssd::serve(listener, &address, policy, |e| eprintln!("{e}"))?;
+//! dbus_proxy::probe(&address)?;
+//! let proxy = dbus_proxy::serve(listener, &address, policy, |e| eprintln!("{e}"))?;
 //! // ... run the program with DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/app/bus
 //! drop(proxy); // stops serving and closes every connection
 //! # Ok(()) }
@@ -194,7 +194,7 @@ pub fn serve(listener: UnixListener, address: &str, policy: Policy, events: impl
     let (stop, stop_w) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
     listener.set_nonblocking(true)?;
     let sh = Arc::new(Shared { upstream: address.to_string(), policy: Arc::new(policy), events: Arc::new(events), stop });
-    let thread = std::thread::Builder::new().name("vssd".into()).spawn(move || accept_loop(listener, sh))?;
+    let thread = std::thread::Builder::new().name("dbus-proxy".into()).spawn(move || accept_loop(listener, sh))?;
     Ok(Proxy { stop: Some(stop_w), thread: Some(thread) })
 }
 
@@ -225,7 +225,7 @@ fn accept_loop(listener: UnixListener, sh: Arc<Shared>) {
                 let conn = next.fetch_add(1, Ordering::Relaxed);
                 let sh2 = sh.clone();
                 let spawned = std::thread::Builder::new()
-                    .name(format!("vssd-{conn}"))
+                    .name(format!("dbus-proxy-{conn}"))
                     .stack_size(512 * 1024)
                     .spawn(move || conn::serve(s, conn, &sh2));
                 match spawned {

@@ -4,7 +4,7 @@ A Cargo workspace (virtual manifest at the root, one `Cargo.lock` and
 `target/` for all crates):
 
 - `vssb/`: the embeddable sandbox library. Read `vssb/AGENTS.md`.
-- `vssd/`: the filtering D-Bus proxy library. Read `vssd/AGENTS.md`.
+- `dbus-proxy/`: the filtering D-Bus proxy library. Read `dbus-proxy/AGENTS.md`.
 - `vssr/`: the command-line front end built on both (policy files,
   detection, audit log). Read `vssr/AGENTS.md`.
 

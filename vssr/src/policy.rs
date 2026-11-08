@@ -324,7 +324,7 @@ pub struct GuiCfg {
     pub insecure_wayland: bool,
 }
 
-/// The session bus through vssd's filter; the lists mean what
+/// The session bus through dbus-proxy's filter; the lists mean what
 /// xdg-dbus-proxy's `--talk`, `--own`, `--see`, `--call` and
 /// `--broadcast` mean.
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -513,7 +513,7 @@ fn add_wayland(gui: &GuiCfg, uid: u32, compositor: PathBuf, mounts: &mut BTreeMa
     Ok(WaylandPlan { compositor, runtime_dir, app_id: gui.app_id.clone(), insecure: gui.insecure_wayland })
 }
 
-/// The session bus through vssd's filter. The proxy and its socket are
+/// The session bus through dbus-proxy's filter. The proxy and its socket are
 /// set up when the run starts (`main.rs`), so the socket isn't among the
 /// mounts.
 #[derive(Debug, Clone)]
@@ -525,7 +525,7 @@ pub struct DbusPlan {
     /// The filter, written as xdg-dbus-proxy's arguments (`--talk=…`,
     /// `--own=…` and the rest, in policy order), for the log.
     pub rules: Vec<String>,
-    pub policy: vssd::Policy,
+    pub policy: dbus_proxy::Policy,
 }
 
 impl DbusPlan {
@@ -603,7 +603,7 @@ fn bus_name_covers(pattern: &str, name: &str) -> bool {
 /// proxy's filter.
 fn add_dbus(cfg: &DbusCfg, uid: u32, upstream: String, mounts: &mut BTreeMap<PathBuf, Mount>, warnings: &mut Vec<String>) -> Result<DbusPlan> {
     let mut rules = vec![];
-    let mut policy = vssd::Policy::new();
+    let mut policy = dbus_proxy::Policy::new();
     for (key, list) in [("see", &cfg.see), ("talk", &cfg.talk), ("own", &cfg.own)] {
         for n in list {
             let r = match key {
