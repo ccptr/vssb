@@ -91,9 +91,9 @@ struct RunArgs {
     /// The app id the compositor gets for the program's windows (with --wayland)
     #[arg(long, value_name = "ID")]
     app_id: Option<String>,
-    /// Give the program the session bus through xdg-dbus-proxy's filter,
-    /// which lets it reach only the names it is allowed (--dbus-talk and
-    /// the rest, or the policy's [dbus] lists)
+    /// Give the program the session bus through vssr's filter, which lets
+    /// it reach only the names it is allowed (--dbus-talk and the rest, or
+    /// the policy's [dbus] lists)
     #[arg(long)]
     dbus: bool,
     /// A bus name (or org.example.* prefix) the program may call; implies --dbus
@@ -395,7 +395,7 @@ fn sigset(sigs: &[libc::c_int]) -> libc::sigset_t {
 fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>) -> Result<i32> {
 
     // Forwarded signals arrive on a signalfd. Block them before any thread
-    // starts, so the proxy's threads inherit the mask and never take one.
+    // starts, so the proxies' threads inherit the mask and never take one.
     let fwd = sigset(&FORWARDED);
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &fwd, std::ptr::null_mut()) };
     let sfd = unsafe { libc::signalfd(-1, &fwd, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
@@ -412,7 +412,7 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
         _ => None,
     };
     let dbus = match (&plan.dbus, &dir) {
-        (Some(d), Some(dir)) => Some(start_dbus(d, dir, plan.quiet, audit)?),
+        (Some(d), Some(dir)) => Some(start_dbus(d, dir, audit)?),
         _ => None,
     };
 
@@ -512,34 +512,85 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
 
 /// This run's directory for the sockets vssr hands over,
 /// `$XDG_RUNTIME_DIR/vssr/<id>`, removed when dropped (after what is in it).
+/// vssr holds a lock on it for the run, so a directory nobody holds is a
+/// killed run's, and the next run removes it.
 struct RunDir {
     path: PathBuf,
     fd: OwnedFd,
     parent: OwnedFd,
     name: std::ffi::CString,
+    _lock: OwnedFd,
+}
+
+/// Opens `dir` (an `O_PATH` descriptor) for reading and takes `flock`'s
+/// exclusive lock on it, waiting for it unless `wait` is false.
+fn lock_dir(dir: &OwnedFd, wait: bool) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let how = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
+    if unsafe { libc::flock(fd.as_raw_fd(), how) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Removes the run directories under `parent` that no vssr holds (left by
+/// a killed run), with the sockets in them. Called with `parent` locked.
+fn sweep_run_dirs(parent: &OwnedFd) {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd())) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(id) = name.to_str().filter(|n| valid_id(n)) else { continue };
+        let Ok(dir) = util::open_dir(parent.as_raw_fd(), id.as_bytes()) else { continue };
+        let Ok(lock) = lock_dir(&dir, false) else { continue };
+        if let Ok(inner) = std::fs::read_dir(format!("/proc/self/fd/{}", lock.as_raw_fd())) {
+            for f in inner.flatten() {
+                if f.file_type().is_ok_and(|t| !t.is_dir())
+                    && let Ok(c) = std::ffi::CString::new(f.file_name().as_encoded_bytes())
+                {
+                    unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) };
+                }
+            }
+        }
+        if let Ok(c) = std::ffi::CString::new(id) {
+            unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
+        }
+    }
 }
 
 impl RunDir {
     fn create(writable: &[PathBuf], id: &str) -> Result<RunDir> {
-        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if !valid_id(id) {
             bail!("invalid run id {id:?} (letters, digits, '-' and '_')");
         }
         let rt = std::env::var("XDG_RUNTIME_DIR").context("$XDG_RUNTIME_DIR is not set (needed for the Wayland and D-Bus sockets)")?;
         let rt = std::fs::canonicalize(&rt).with_context(|| format!("$XDG_RUNTIME_DIR {rt}"))?;
         let base = rt.join("vssr");
         let parent = util::make_dirs(&base, writable, 0o700)?;
+        // Other runs create and sweep under the same lock, so a directory
+        // is never taken for stale between its creation and its lock.
+        let _base_lock = lock_dir(&parent, true).with_context(|| format!("locking {}", base.display()))?;
+        sweep_run_dirs(&parent);
         let name = std::ffi::CString::new(id)?;
         if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
             bail!("creating {}: {}", base.join(id).display(), std::io::Error::last_os_error());
         }
-        let fd = match util::open_dir(parent.as_raw_fd(), id.as_bytes()) {
-            Ok(fd) => fd,
+        let opened = util::open_dir(parent.as_raw_fd(), id.as_bytes()).and_then(|fd| Ok((lock_dir(&fd, false)?, fd)));
+        let (lock, fd) = match opened {
+            Ok(v) => v,
             Err(e) => {
                 unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
                 return Err(anyhow::Error::new(e).context(format!("opening {}", base.join(id).display())));
             }
         };
-        Ok(RunDir { path: base.join(id), fd, parent, name })
+        Ok(RunDir { path: base.join(id), fd, parent, name, _lock: lock })
     }
 }
 
@@ -575,101 +626,68 @@ fn start_wayland(w: &policy::WaylandPlan, dir: &RunDir, id: &str, audit: &Audit)
     Ok(ctx)
 }
 
-/// A running xdg-dbus-proxy. Dropping it stops the proxy and removes its
-/// socket.
+/// The running D-Bus filter. Dropping it stops the proxy (closing every
+/// connection) and removes its socket.
 struct DbusProxy {
-    child: std::process::Child,
-    /// The read end of the proxy's `--fd` pipe: it stops (removing its
-    /// socket) when this closes, so with vssr however vssr ends.
-    _alive: OwnedFd,
+    proxy: Option<vssd::Proxy>,
     socket: PathBuf,
     dir: OwnedFd,
 }
 
 impl Drop for DbusProxy {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.proxy.take());
         unsafe { libc::unlinkat(self.dir.as_raw_fd(), c"bus".as_ptr(), 0) };
     }
 }
 
-/// How long xdg-dbus-proxy may take to be ready.
-const DBUS_READY: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Starts xdg-dbus-proxy on `<dir>/bus` with the plan's filter and waits
-/// until it accepts connections. Runs before any thread is started.
-fn start_dbus(d: &policy::DbusPlan, dir: &RunDir, quiet: bool, audit: &Audit) -> Result<DbusProxy> {
-    use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::process::CommandExt;
-    // The proxy only connects once a client does; say so now instead.
-    let is_socket = |p: &PathBuf| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket());
-    if !d.host_sockets.is_empty() && !d.host_sockets.iter().any(is_socket) {
-        bail!("dbus.session: there is no session bus at {} (from {})", d.host_sockets[0].display(), d.upstream);
-    }
-    let mut p = [0; 2];
-    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-        bail!("pipe: {}", std::io::Error::last_os_error());
-    }
-    let (alive, ready) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
-    // The proxy gets these two by number; the socket is made through the
-    // directory descriptor, so no symlink on the way is followed.
-    let ready_fd = ready.as_raw_fd();
+/// Starts the filter on `<dir>/bus`, once the session bus has taken our
+/// login. Its threads (one to accept, one per connection) report to the
+/// audit log.
+fn start_dbus(d: &policy::DbusPlan, dir: &RunDir, audit: &Arc<Audit>) -> Result<DbusProxy> {
+    vssd::probe(&d.upstream).map_err(|e| anyhow::anyhow!("dbus.session: the session bus at {}: {e}", d.upstream))?;
     let dir_fd = dir.fd.try_clone().context("duplicating the run directory")?;
-    let dir_raw = dir_fd.as_raw_fd();
-    let mut cmd = std::process::Command::new("xdg-dbus-proxy");
-    cmd.arg(&d.upstream)
-        .arg(format!("/proc/self/fd/{dir_raw}/bus"))
-        .arg("--filter")
-        .args(&d.rules)
-        .arg(format!("--fd={ready_fd}"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        // Out of the terminal's process group: the terminal's SIGINT is the
-        // program's to handle, and the proxy must outlive it.
-        .process_group(0);
-    if quiet {
-        cmd.stderr(std::process::Stdio::null());
-    }
-    // No PR_SET_PDEATHSIG: the pipe already stops the proxy when vssr dies,
-    // and lets it remove its socket first, which a SIGKILL would not.
-    unsafe {
-        cmd.pre_exec(move || {
-            // Nothing of vssr's but the two descriptors reaches the proxy.
-            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC);
-            for fd in [ready_fd, dir_raw] {
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        })
-    };
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("dbus.session: xdg-dbus-proxy is not installed (or not in $PATH)")
-        }
-        Err(e) => return Err(anyhow::Error::new(e).context("dbus.session: starting xdg-dbus-proxy")),
-    };
-    drop(ready);
-    // One byte once it listens; end of file if it exits first.
-    let mut pfd = libc::pollfd { fd: alive.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    let n = unsafe { libc::poll(&mut pfd, 1, DBUS_READY.as_millis() as i32) };
-    let mut b = 0u8;
-    if !(n > 0 && unsafe { libc::read(alive.as_raw_fd(), (&mut b as *mut u8).cast(), 1) } == 1) {
-        let _ = child.kill();
-        let status = child.wait().map(|s| s.to_string()).unwrap_or_default();
-        unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c"bus".as_ptr(), 0) };
-        let why = if n == 0 { format!("was not ready after {}s", DBUS_READY.as_secs()) } else { format!("exited ({status})") };
-        bail!("dbus.session: xdg-dbus-proxy {why}; session bus {}", d.upstream);
-    }
-    let proxy = DbusProxy { child, _alive: alive, socket: dir.path.join("bus"), dir: dir_fd };
-    audit.event(
-        "dbus",
-        json!({"upstream": d.upstream, "socket": d.socket(), "rules": d.rules, "proxy_pid": proxy.child.id()}),
-    );
+    // Bound through the directory descriptor, so no symlink on the way is
+    // followed.
+    let listener = std::os::unix::net::UnixListener::bind(format!("/proc/self/fd/{}/bus", dir_fd.as_raw_fd()))
+        .with_context(|| format!("dbus.session: creating {}", dir.path.join("bus").display()))?;
+    // From here on, dropping it removes the socket.
+    let mut proxy = DbusProxy { proxy: None, socket: dir.path.join("bus"), dir: dir_fd };
+    let a = audit.clone();
+    let shown = std::sync::Mutex::new(std::collections::HashSet::new());
+    let served = vssd::serve(listener, &d.upstream, d.policy.clone(), move |e| dbus_event(&a, &shown, e));
+    proxy.proxy = Some(served.context("dbus.session: starting the filter")?);
+    audit.event("dbus", json!({"upstream": d.upstream, "socket": d.socket(), "rules": d.rules}));
     Ok(proxy)
+}
+
+/// Logs what the D-Bus filter did. Each kind of blocked message is also
+/// shown once (programs often retry, or probe for many services).
+fn dbus_event(audit: &Audit, shown: &std::sync::Mutex<std::collections::HashSet<String>>, e: &vssd::Event) {
+    match e {
+        vssd::Event::Connect { conn, unique } => audit.event("dbus_connect", json!({"conn": conn, "unique": unique})),
+        vssd::Event::Close { conn, error } => audit.event("dbus_close", json!({"conn": conn, "error": error})),
+        vssd::Event::Deny { conn, denied } => {
+            let fields = json!({
+                "action": "deny",
+                "conn": conn,
+                "kind": denied.kind.name(),
+                "destination": denied.destination,
+                "path": denied.path,
+                "interface": denied.interface,
+                "member": denied.member,
+                "name": denied.name,
+                "reason": denied.reason.text(),
+            });
+            let text = format!("blocked D-Bus {denied}");
+            let first = shown.lock().unwrap_or_else(|e| e.into_inner()).insert(text.clone());
+            if first {
+                audit.say("dbus", fields, &text);
+            } else {
+                audit.event("dbus", fields);
+            }
+        }
+    }
 }
 
 /// Passes pending signals on to the program (through the sandbox's PID 1).

@@ -4,7 +4,7 @@
 # Network tests need internet access and are skipped with VSSR_TEST_OFFLINE=1.
 # Wayland tests need a headless compositor with security contexts (sway),
 # named by VSSR_TEST_WAYLAND (e.g. wayland-2); never the live session's.
-# D-Bus tests run on a private bus (dbus-daemon, dbus-test-tool, xdg-dbus-proxy);
+# D-Bus tests run on a private bus (dbus-daemon, dbus-test-tool, dbus-send);
 # one makes a read-only call to the session bus's systemd.
 # Resource-limit tests need a systemd user manager.
 set -u
@@ -511,7 +511,7 @@ else
 fi
 
 echo "== dbus"
-if command -v dbus-daemon >/dev/null && command -v dbus-test-tool >/dev/null && command -v dbus-send >/dev/null && command -v xdg-dbus-proxy >/dev/null; then
+if command -v dbus-daemon >/dev/null && command -v dbus-test-tool >/dev/null && command -v dbus-send >/dev/null; then
     dbus-daemon --session --address="unix:path=$WORK/bus" --nofork --nopidfile >/dev/null 2>&1 & bus_pid=$!
     for _ in $(seq 50); do [ -S "$WORK/bus" ] && break; sleep 0.1; done
     export DBUS_SESSION_BUS_ADDRESS="unix:path=$WORK/bus"
@@ -533,20 +533,31 @@ if command -v dbus-daemon >/dev/null && command -v dbus-test-tool >/dev/null && 
     expect_out "name lists without dbus.session give a warning" '^vssr: warning: dbus: .*session = true' -- run -p nosession.toml -- true
     expect_out "  ...and run without one" '^nobus$' -- run -p nosession.toml -- sh -c 'test -z "$DBUS_SESSION_BUS_ADDRESS" && ! test -e /run/user/'"$(id -u)"'/bus && echo nobus'
     rm -f nosession.toml
+    printf '[fs]\nrw = ["."]\n[sandbox]\nuid = 0\n[dbus]\nsession = true\ntalk = ["org.vssr.Allowed"]\n' > root.toml
+    expect_out "the program gets the bus as root in its namespace too" '^0 org.vssr.Allowed$' -- run -p root.toml -- sh -c "printf '%s ' \$(id -u); $(call org.vssr.Allowed)"
+    rm -f root.toml
+    expect_out "a blocked call is reported" '^vssr: blocked D-Bus call org.vssr.Test.Call to org.vssr.Other at /: name not visible$' \
+        -- run --dbus-talk org.vssr.Allowed -- sh -c "$(call org.vssr.Other) || true"
+    "$V" run --audit-log "$WORK/dbus.jsonl" --dbus-talk org.vssr.Allowed -- sh -c "$(call org.vssr.Other); $(call org.vssr.Other)" >/dev/null 2>&1
+    [ "$(grep '"action":"deny"' "$WORK/dbus.jsonl" | grep '"destination":"org.vssr.Other"' | grep -c '"event":"dbus"')" = 2 ] \
+        && grep -q '"event":"dbus_connect".*"unique":":' "$WORK/dbus.jsonl" \
+        && ok "  ...in the audit log, every time" || bad "  ...in the audit log, every time" "$(grep dbus "$WORK/dbus.jsonl")"
     bid=dbus-test-$$
     VSSR_ID=$bid "$V" run --dbus -- sh -c 'test -S "$XDG_RUNTIME_DIR/bus"' >/dev/null 2>&1 && [ ! -e "$XDG_RUNTIME_DIR/vssr/$bid" ] \
-        && ! pgrep -f "^xdg-dbus-proxy unix:path=$WORK/bus" >/dev/null \
-        && ok "the proxy stops and its socket goes after the run" || bad "the proxy stops and its socket goes after the run" "$(ls -la "$XDG_RUNTIME_DIR/vssr/$bid" 2>&1)"
+        && ok "the proxy's socket and directory go after the run" || bad "the proxy's socket and directory go after the run" "$(ls -la "$XDG_RUNTIME_DIR/vssr/$bid" 2>&1)"
     VSSR_ID=$bid-killed "$V" run --dbus -- sleep 30 >/dev/null 2>&1 & vpid=$!
-    for _ in $(seq 50); do pgrep -f "^xdg-dbus-proxy unix:path=$WORK/bus" >/dev/null && break; sleep 0.1; done
+    for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/vssr/$bid-killed/bus" ] && break; sleep 0.1; done
     kill -9 $vpid; wait $vpid 2>/dev/null
-    for _ in $(seq 50); do pgrep -f "^xdg-dbus-proxy unix:path=$WORK/bus" >/dev/null || break; sleep 0.1; done
-    # A killed vssr leaves its directory, which must be empty.
-    ! pgrep -f "^xdg-dbus-proxy unix:path=$WORK/bus" >/dev/null && rmdir "$XDG_RUNTIME_DIR/vssr/$bid-killed" \
-        && ok "  ...also when vssr is killed" || bad "  ...also when vssr is killed" "$(ls -la "$XDG_RUNTIME_DIR/vssr/$bid-killed" 2>&1)"
+    # A killed vssr leaves its directory behind; the next run removes it.
+    [ -S "$XDG_RUNTIME_DIR/vssr/$bid-killed/bus" ] && "$V" run --dbus -- true >/dev/null 2>&1 && [ ! -e "$XDG_RUNTIME_DIR/vssr/$bid-killed" ] \
+        && ok "  ...and a killed run's go with the next run" || bad "  ...and a killed run's go with the next run" "$(ls -la "$XDG_RUNTIME_DIR/vssr/$bid-killed" 2>&1)"
     rm -rf "${XDG_RUNTIME_DIR:?}/vssr/$bid-killed"
+    VSSR_ID=$bid-live "$V" run --dbus -- sleep 3 >/dev/null 2>&1 & vpid=$!
+    for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/vssr/$bid-live/bus" ] && break; sleep 0.1; done
+    "$V" run --dbus -- true >/dev/null 2>&1
+    [ -S "$XDG_RUNTIME_DIR/vssr/$bid-live/bus" ] && ok "  ...but a running one's stay" || bad "  ...but a running one's stay"
+    wait $vpid
     DBUS_SESSION_BUS_ADDRESS=unix:path=$WORK/nobus expect "a missing session bus is a setup error" 125 -- run --dbus -- true
-    PATH=/nonexistent "$V" run --dbus -- true >/dev/null 2>&1; [ $? = 125 ] && ok "a missing xdg-dbus-proxy is a setup error" || bad "a missing xdg-dbus-proxy is a setup error"
     kill $echo1 $echo2 $bus_pid 2>/dev/null; wait $echo1 $echo2 $bus_pid 2>/dev/null
     # The session bus itself, with a read-only call: systemd starts any command for a caller it can reach.
     export DBUS_SESSION_BUS_ADDRESS=$SESSION_BUS
@@ -557,7 +568,7 @@ if command -v dbus-daemon >/dev/null && command -v dbus-test-tool >/dev/null && 
         echo " skip the session bus's systemd (not reachable here)"
     fi
 else
-    echo " skip dbus (needs dbus-daemon, dbus-test-tool, dbus-send and xdg-dbus-proxy)"
+    echo " skip dbus (needs dbus-daemon, dbus-test-tool and dbus-send)"
 fi
 
 echo "== resource limits"

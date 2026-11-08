@@ -351,6 +351,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vssd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "vssr"
 version = "0.1.0"
 dependencies = [
@@ -361,6 +368,7 @@ dependencies = [
  "serde_json",
  "toml",
  "vssb",
+ "vssd",
 ]
 
 [[package]]

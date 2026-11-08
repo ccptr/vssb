@@ -37,8 +37,6 @@ resolves.
 - Unprivileged user namespaces enabled (the default on most distributions;
   Ubuntu 24.04+ restricts them through AppArmor and needs a profile).
 - x86_64 or aarch64.
-- For `--dbus`: `xdg-dbus-proxy` (packaged on its own by most
-  distributions).
 - For a memory limit: a systemd user manager, or a cgroup
   you prepared (`--cgroup`). Without either,
   `cpus` pins the sandbox to that many CPUs and `pids` sizes its PID
@@ -157,7 +155,7 @@ app_id = "org.example.App"   # reported to the compositor
 insecure_wayland = false     # run even if capture, clipboard or input protocols stay visible
 
 [dbus]
-session = true          # the session bus, through xdg-dbus-proxy's filter
+session = true          # the session bus, through vssr's filter (vssd)
 talk = ["org.freedesktop.Notifications"]   # names it may call; "org.example.*" for a prefix
 own = ["org.example.App"]                  # names it may own
 see = []                # names it may only see
@@ -249,24 +247,29 @@ audio yet.
 
 **D-Bus.** The sandbox never sees the session bus itself. With
 `dbus.session` (`--dbus`, or any of `--dbus-talk`, `--dbus-own`,
-`--dbus-see`), vssr starts `xdg-dbus-proxy` outside the sandbox, as
-Flatpak does, on the bus at `$DBUS_SESSION_BUS_ADDRESS` (default
-`$XDG_RUNTIME_DIR/bus`) with `--filter` and the `[dbus]` lists as its
-`--talk`, `--own`, `--see`, `--call` and `--broadcast` rules. Names the
-filter doesn't let through don't exist as far as the program can tell:
-calls to them fail as if no one owned them, and they are left out of
-`ListNames`. The program can always talk to the bus itself; nothing at
-all is the filter with empty lists. Inside it gets a private
+`--dbus-see`), vssr serves the program's bus itself, outside the
+sandbox, through [vssd](../vssd)'s filter, connected to the bus at
+`$DBUS_SESSION_BUS_ADDRESS` (default `$XDG_RUNTIME_DIR/bus`). The
+`[dbus]` lists mean what xdg-dbus-proxy's `--talk`, `--own`, `--see`,
+`--call` and `--broadcast` mean, as in Flatpak. Names the filter doesn't
+let through don't exist as far as the program can tell: calls to them
+fail as if no one owned them, and they are left out of `ListNames`. The
+program can always talk to the bus itself (eavesdropping and monitoring
+excepted); nothing at all is the filter with empty lists. vssd's README
+lists what passes. Inside it gets a private
 `/run/user/<uid>` tmpfs (shared with Wayland's) holding the proxy's
 socket as `bus`, with `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
 set to match, and `NO_AT_BRIDGE=1` unless the policy sets it (the
 accessibility bus is reached through the session bus); the session's own
-socket is hidden wherever a bind would show it. vssr waits until the
-proxy accepts connections before starting the program, stops it and
-removes its socket (in `$XDG_RUNTIME_DIR/vssr/<id>/`) when the run ends,
-and the proxy stops by itself if vssr dies. The program's uid must be
-yours (no `sandbox.uid`): the bus checks the uid a client claims. Names
-in `talk` or `own` that reach `org.freedesktop.systemd1` or
+socket is hidden wherever a bind would show it. vssr checks that the bus
+takes its login before starting the program, and closes every connection
+and removes the socket (in `$XDG_RUNTIME_DIR/vssr/<id>/`) when the run
+ends; a killed vssr's directory goes at the next run that needs one. The
+proxy logs in to the bus for the program, so `sandbox.uid` doesn't
+matter. Each message it blocks is a `dbus` event in the audit log, and
+each kind of message is shown once on stderr (`vssr: blocked D-Bus call
+org.example.X.Y to org.example.X at /: name not visible`). Names in `talk`
+or `own` that reach `org.freedesktop.systemd1` or
 `org.freedesktop.Flatpak`, which run commands on the host, give a
 warning at start. There is no system bus.
 
@@ -283,7 +286,8 @@ set) and `event`:
 | `setup_failed` | the sandbox couldn't be set up or the program not run (`code`, `error`); no `start` follows |
 | `warning` | a limit isn't in effect (`limit`, `text`), `insecure_wayland` let escape protocols through (`wayland_escapes`), a D-Bus name reaches a service that runs host commands, or the `[dbus]` name lists are set without `session = true` (`text`) |
 | `wayland` | the security context is in place (`compositor`, `app_id`, `globals` offered through it, `escapes`) |
-| `dbus` | the D-Bus proxy accepts connections (`upstream`, `socket`, `rules`, `proxy_pid`) |
+| `dbus` | the D-Bus filter accepts connections (`upstream`, `socket`, `rules`); then each message it blocked (`action: "deny"`, `conn`, `kind`, `destination`, `path`, `interface`, `member`, `name`: what a bus method was about, `reason`) |
+| `dbus_connect`, `dbus_close` | a connection to the D-Bus filter: its unique name (`conn`, `unique`), then how it ended (`error`, null for a plain close) |
 | `net`, `net_close` | each proxied connection: allowed, denied or failed, then its byte counts |
 | `signal` | a signal passed on to the program |
 | `timeout` | the timeout hit; SIGTERM, then SIGKILL after `kill_grace` |
@@ -367,6 +371,11 @@ Think about what you expose, not only what you block.
   and a prefix such as `org.freedesktop.*` reaches all of them. Prefer
   portals (`org.freedesktop.portal.Desktop`) and the specific names an
   app needs.
+- The D-Bus filter runs in vssr, outside the sandbox, with your full
+  access to the session bus, so a flaw in it would hand the program the
+  whole bus. It parses and checks every header at least as strictly as
+  dbus-daemon before deciding, and refuses what it doesn't know (see
+  vssd's README).
 - `--tty` keeps your terminal attached so interactive tools work.
   TIOCSTI is blocked, but the agent can still print escape sequences to
   your terminal; prefer non-tty mode for unattended runs. Ctrl-C and

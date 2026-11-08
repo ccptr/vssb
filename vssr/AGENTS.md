@@ -7,15 +7,17 @@ vssr is the front end; the sandbox itself is
 [vssb](../vssb) (the sibling crate in this workspace), which builds
 the namespaces, mounts, Landlock, seccomp and cgroup scope. Changes to
 how the sandbox is built, and their tests, go there; vssr turns policy
-into a `vssb::Sandbox` and `vssb::Command`.
+into a `vssb::Sandbox` and `vssb::Command`. The D-Bus filter is
+[vssd](../vssd), likewise: vssr turns `[dbus]` into a `vssd::Policy` and
+its events into audit events.
 
 ## Layout
 
 - `src/main.rs`: CLI, policy overrides, supervisor (creates the run
-  directory, the Wayland security context and the xdg-dbus-proxy,
-  spawns the sandbox, serves the proxy, forwards signals from a
-  signalfd, timeout, audit events), all on one thread apart from the
-  proxy's.
+  directory, sweeping killed runs' ones, the Wayland security context
+  and the D-Bus filter, spawns the sandbox, serves the HTTP proxy,
+  forwards signals from a signalfd, timeout, audit events), all on one
+  thread apart from the two proxies'.
 - `src/policy.rs`: TOML policy and its resolution into a `Plan` (mount
   list as `vssb::Mount`s sorted parent-first, env, net, limits), and
   `Plan::sandbox`/`Plan::command`, which map it onto vssb.
@@ -61,10 +63,13 @@ into a `vssb::Sandbox` and `vssb::Command`.
   quiet), never straight to stderr once the log is open.
 - The forwarded signals are blocked before the sandbox or any proxy
   thread starts, so only the signalfd receives them.
-- xdg-dbus-proxy is forked before any thread starts, and gets only its
-  `--fd` pipe and the run directory's descriptor (everything else is
-  close-on-exec). It binds its socket through that descriptor, never by
-  a path from the host's environment.
+- Sockets in the run directory are bound through a descriptor of the
+  directory opened without following symlinks (`/proc/self/fd/N/bus` for
+  the D-Bus filter's; vssb does the same for the Wayland one), never by a
+  path from the host's environment.
+- A run holds `flock` on its run directory until it ends; creating a run
+  directory and sweeping unlocked (killed runs') ones happen under the
+  lock of `$XDG_RUNTIME_DIR/vssr`, so a new directory is never swept.
 - vssb's own invariants (fork safety of the child, mount-point lookup,
   seccomp last) are listed in its AGENTS.md.
 
@@ -75,7 +80,7 @@ the proxy tests and a systemd user manager for the limit tests; the
 Wayland tests need `VSSR_TEST_WAYLAND` naming a headless compositor, and
 the script unsets `WAYLAND_DISPLAY` so nothing else reaches the live
 session; the D-Bus tests start their own bus, and make only a read-only
-call to the session bus). Add an
+call to the session bus). The D-Bus filter's own tests are vssd's. Add an
 integration test for every new guarantee; guarantees of the sandbox
 itself also get one in vssb's `tests/sandbox.rs`.
 

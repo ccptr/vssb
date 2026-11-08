@@ -4,7 +4,8 @@ Status: proposal, 2026-11-05. Implemented so far: the prototype of the
 Wayland decision gate (1), run on sway and Hyprland on 2026-11-07 (it
 passes on both), then `fs.sockets` (2), Wayland through a security
 context with the check at every start (1) and D-Bus through
-xdg-dbus-proxy (3), all on 2026-11-07. Part of
+xdg-dbus-proxy (3), all on 2026-11-07; the same day xdg-dbus-proxy was
+replaced by vssr's own filter, the vssd crate (3). Part of
 the general-purpose direction in [ergonomics.md](ergonomics.md).
 
 ## Problem
@@ -72,7 +73,7 @@ audio = false                # the PipeWire socket: all streams, including captu
 [dbus]
 talk = ["org.freedesktop.Notifications", "org.freedesktop.portal.*"]
 own = ["org.example.App"]
-# see = [], call = [], broadcast = []   # passed to xdg-dbus-proxy as is
+# see = [], call = [], broadcast = []   # xdg-dbus-proxy's rules, same meaning
 
 [fs]
 sockets = ["$XDG_RUNTIME_DIR/some.sock"]   # unix sockets the program may connect to (see 2)
@@ -259,6 +260,27 @@ Built on 2026-11-07 as above, with these choices:
   the proxy's, so the program would only hang.
 - `NO_AT_BRIDGE=1` is set unless the policy sets it.
 
+Replaced on 2026-11-07 by vssr's own filter, the
+[vssd](../../../vssd) crate, run in vssr's process (threads, like the
+HTTP proxy) with the same rules and `[dbus]` surface. What changed:
+
+- No external binary and no subprocess: the socket is bound through
+  `/proc/self/fd/N/bus` by vssr and served by `vssd::serve`; `vssd::probe`
+  checks the bus takes our login before the program starts.
+- The proxy logs in to the bus as vssr and accepts the program's
+  `EXTERNAL` login whatever uid it claims (peer credentials must be
+  ours), so `sandbox.uid` works with the bus and the refusal is gone.
+- Every blocked message is a `dbus` audit event (destination, interface,
+  member, path, reason), shown once per kind on stderr; connections are
+  `dbus_connect` / `dbus_close` events.
+- An in-process proxy can't remove its socket when vssr is SIGKILLed, so
+  each run holds `flock` on its run directory, and the next run that
+  creates one removes unlocked (killed runs') directories, under a lock
+  on `$XDG_RUNTIME_DIR/vssr`.
+- vssd's README lists what passes and how it differs from
+  xdg-dbus-proxy (stricter header checks, no `ReloadConfig`, no method
+  calls without a destination).
+
 ## 4. X11 only through a private Xwayland
 
 No access to the session's X server. For apps that need X11, the
@@ -333,7 +355,8 @@ To explore (unverified):
    Done on 2026-11-07.
 2. Wayland through a security context, with the check at every start (1).
    Done on 2026-11-07.
-3. `xdg-dbus-proxy` and `[dbus]` (3). Done on 2026-11-07.
+3. `xdg-dbus-proxy` and `[dbus]` (3). Done on 2026-11-07, then moved
+   onto vssr's own filter (vssd) the same day.
 4. Per-app home, environment, `XDG_RUNTIME_DIR`, fonts and themes; two
    or three example profiles in `examples/` (6).
 5. `gpu` and `audio` (5).

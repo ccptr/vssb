@@ -1,0 +1,10 @@
+[package]
+name = "vssd"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Filtering D-Bus proxy: gives a sandboxed program a session bus that reaches only the names its policy allows"
+publish = false
+
+[dependencies]
+libc = "0.2.191"
