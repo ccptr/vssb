@@ -91,6 +91,20 @@ struct RunArgs {
     /// The app id the compositor gets for the program's windows (with --wayland)
     #[arg(long, value_name = "ID")]
     app_id: Option<String>,
+    /// Give the program the session bus through xdg-dbus-proxy's filter,
+    /// which lets it reach only the names it is allowed (--dbus-talk and
+    /// the rest, or the policy's [dbus] lists)
+    #[arg(long)]
+    dbus: bool,
+    /// A bus name (or org.example.* prefix) the program may call; implies --dbus
+    #[arg(long, value_name = "NAME")]
+    dbus_talk: Vec<String>,
+    /// A bus name the program may own; implies --dbus
+    #[arg(long, value_name = "NAME")]
+    dbus_own: Vec<String>,
+    /// A bus name the program may only see; implies --dbus
+    #[arg(long, value_name = "NAME")]
+    dbus_see: Vec<String>,
     /// Network mode
     #[arg(long, value_enum)]
     net: Option<NetArg>,
@@ -270,6 +284,12 @@ fn resolve(args: &RunArgs) -> Result<Plan> {
     if args.app_id.is_some() {
         p.gui.app_id = args.app_id.clone();
     }
+    if args.dbus || !(args.dbus_talk.is_empty() && args.dbus_own.is_empty() && args.dbus_see.is_empty()) {
+        p.dbus.session = true;
+    }
+    p.dbus.talk.extend(args.dbus_talk.iter().cloned());
+    p.dbus.own.extend(args.dbus_own.iter().cloned());
+    p.dbus.see.extend(args.dbus_see.iter().cloned());
     p.detect.within.extend(args.detect_within.iter().cloned());
     p.detect.within_rw.extend(args.detect_within_rw.iter().cloned());
     if let Some(m) = args.detect_project {
@@ -348,6 +368,9 @@ fn run(args: RunArgs) -> Result<i32> {
     for n in &plan.notes {
         audit.say("note", json!({"text": n}), n);
     }
+    for w in &plan.warnings {
+        audit.say("warning", json!({"text": w}), &format!("warning: {w}"));
+    }
     // From here on, failures are events too (and stay off stderr if quiet).
     supervise(&plan, &id, &audit, fds).or_else(|e| {
         let msg = format!("{e:#}");
@@ -381,8 +404,17 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
     }
     let sfd = unsafe { OwnedFd::from_raw_fd(sfd) };
 
-    // Kept until the sandbox has exited; dropping it stops the listener.
-    let wayland = plan.wayland.as_ref().map(|w| start_wayland(w, &plan.writable, id, audit)).transpose()?;
+    // Kept until the sandbox has exited, and dropped in reverse order: the
+    // proxy and the listener stop, then their directory goes.
+    let dir = if plan.wayland.is_some() || plan.dbus.is_some() { Some(RunDir::create(&plan.writable, id)?) } else { None };
+    let wayland = match (&plan.wayland, &dir) {
+        (Some(w), Some(dir)) => Some(start_wayland(w, dir, id, audit)?),
+        _ => None,
+    };
+    let dbus = match (&plan.dbus, &dir) {
+        (Some(d), Some(dir)) => Some(start_dbus(d, dir, plan.quiet, audit)?),
+        _ => None,
+    };
 
     let started = Instant::now();
     let mut cmd = plan.command(id);
@@ -390,8 +422,11 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
         cmd.pass_fd(target, fd);
     }
     let mut sb = plan.sandbox();
-    if let (Some(w), Some(run)) = (&plan.wayland, &wayland) {
-        sb.mount(vssb::Mount::socket_at(run.ctx.socket(), w.socket()).no_symlinks());
+    if let (Some(w), Some(ctx)) = (&plan.wayland, &wayland) {
+        sb.mount(vssb::Mount::socket_at(ctx.socket(), w.socket()).no_symlinks());
+    }
+    if let (Some(d), Some(proxy)) = (&plan.dbus, &dbus) {
+        sb.mount(vssb::Mount::socket_at(&proxy.socket, d.socket()).no_symlinks());
     }
     let mut child = match sb.spawn(cmd) {
         Ok(c) => c,
@@ -475,16 +510,37 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
     Ok(code)
 }
 
-/// A security-context listener and the directory holding it,
-/// `$XDG_RUNTIME_DIR/vssr/<id>`, removed in that order when dropped.
-struct WaylandRun {
-    ctx: vssb::wayland::Context,
-    _dir: RunDir,
-}
-
+/// This run's directory for the sockets vssr hands over,
+/// `$XDG_RUNTIME_DIR/vssr/<id>`, removed when dropped (after what is in it).
 struct RunDir {
+    path: PathBuf,
+    fd: OwnedFd,
     parent: OwnedFd,
     name: std::ffi::CString,
+}
+
+impl RunDir {
+    fn create(writable: &[PathBuf], id: &str) -> Result<RunDir> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            bail!("invalid run id {id:?} (letters, digits, '-' and '_')");
+        }
+        let rt = std::env::var("XDG_RUNTIME_DIR").context("$XDG_RUNTIME_DIR is not set (needed for the Wayland and D-Bus sockets)")?;
+        let rt = std::fs::canonicalize(&rt).with_context(|| format!("$XDG_RUNTIME_DIR {rt}"))?;
+        let base = rt.join("vssr");
+        let parent = util::make_dirs(&base, writable, 0o700)?;
+        let name = std::ffi::CString::new(id)?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+            bail!("creating {}: {}", base.join(id).display(), std::io::Error::last_os_error());
+        }
+        let fd = match util::open_dir(parent.as_raw_fd(), id.as_bytes()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+                return Err(anyhow::Error::new(e).context(format!("opening {}", base.join(id).display())));
+            }
+        };
+        Ok(RunDir { path: base.join(id), fd, parent, name })
+    }
 }
 
 impl Drop for RunDir {
@@ -495,21 +551,10 @@ impl Drop for RunDir {
 
 /// Creates the security-context listener and refuses to go on if escape
 /// protocols are visible through it (unless the policy accepts that).
-fn start_wayland(w: &policy::WaylandPlan, writable: &[PathBuf], id: &str, audit: &Audit) -> Result<WaylandRun> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        bail!("invalid run id {id:?} (letters, digits, '-' and '_')");
-    }
-    let rt = std::env::var("XDG_RUNTIME_DIR").context("gui.wayland: $XDG_RUNTIME_DIR is not set")?;
-    let rt = std::fs::canonicalize(&rt).with_context(|| format!("$XDG_RUNTIME_DIR {rt}"))?;
-    let base = rt.join("vssr");
-    let parent = util::make_dirs(&base, writable, 0o700)?;
-    let name = std::ffi::CString::new(id)?;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
-        bail!("creating {}: {}", base.join(id).display(), std::io::Error::last_os_error());
-    }
-    let dir = RunDir { parent, name };
+/// Dropping the context stops the listener and removes its socket.
+fn start_wayland(w: &policy::WaylandPlan, dir: &RunDir, id: &str, audit: &Audit) -> Result<vssb::wayland::Context> {
     let opts = vssb::wayland::Options { engine: "vssr".into(), app_id: w.app_id.clone(), instance_id: Some(id.into()) };
-    let ctx = vssb::wayland::Context::create(&w.compositor, &base.join(id).join("wayland-0"), &opts)
+    let ctx = vssb::wayland::Context::create(&w.compositor, &dir.path.join("wayland-0"), &opts)
         .map_err(|e| anyhow::anyhow!("gui.wayland: {e}"))?;
     let escapes = ctx.escapes();
     audit.event(
@@ -527,7 +572,104 @@ fn start_wayland(w: &policy::WaylandPlan, writable: &[PathBuf], id: &str, audit:
         let text = format!("insecure_wayland: the program can use {list}");
         audit.say("warning", json!({"wayland_escapes": escapes, "text": text}), &format!("warning: {text}"));
     }
-    Ok(WaylandRun { ctx, _dir: dir })
+    Ok(ctx)
+}
+
+/// A running xdg-dbus-proxy. Dropping it stops the proxy and removes its
+/// socket.
+struct DbusProxy {
+    child: std::process::Child,
+    /// The read end of the proxy's `--fd` pipe: it stops (removing its
+    /// socket) when this closes, so with vssr however vssr ends.
+    _alive: OwnedFd,
+    socket: PathBuf,
+    dir: OwnedFd,
+}
+
+impl Drop for DbusProxy {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        unsafe { libc::unlinkat(self.dir.as_raw_fd(), c"bus".as_ptr(), 0) };
+    }
+}
+
+/// How long xdg-dbus-proxy may take to be ready.
+const DBUS_READY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Starts xdg-dbus-proxy on `<dir>/bus` with the plan's filter and waits
+/// until it accepts connections. Runs before any thread is started.
+fn start_dbus(d: &policy::DbusPlan, dir: &RunDir, quiet: bool, audit: &Audit) -> Result<DbusProxy> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::process::CommandExt;
+    // The proxy only connects once a client does; say so now instead.
+    let is_socket = |p: &PathBuf| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket());
+    if !d.host_sockets.is_empty() && !d.host_sockets.iter().any(is_socket) {
+        bail!("dbus.session: there is no session bus at {} (from {})", d.host_sockets[0].display(), d.upstream);
+    }
+    let mut p = [0; 2];
+    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        bail!("pipe: {}", std::io::Error::last_os_error());
+    }
+    let (alive, ready) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
+    // The proxy gets these two by number; the socket is made through the
+    // directory descriptor, so no symlink on the way is followed.
+    let ready_fd = ready.as_raw_fd();
+    let dir_fd = dir.fd.try_clone().context("duplicating the run directory")?;
+    let dir_raw = dir_fd.as_raw_fd();
+    let mut cmd = std::process::Command::new("xdg-dbus-proxy");
+    cmd.arg(&d.upstream)
+        .arg(format!("/proc/self/fd/{dir_raw}/bus"))
+        .arg("--filter")
+        .args(&d.rules)
+        .arg(format!("--fd={ready_fd}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        // Out of the terminal's process group: the terminal's SIGINT is the
+        // program's to handle, and the proxy must outlive it.
+        .process_group(0);
+    if quiet {
+        cmd.stderr(std::process::Stdio::null());
+    }
+    // No PR_SET_PDEATHSIG: the pipe already stops the proxy when vssr dies,
+    // and lets it remove its socket first, which a SIGKILL would not.
+    unsafe {
+        cmd.pre_exec(move || {
+            // Nothing of vssr's but the two descriptors reaches the proxy.
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC);
+            for fd in [ready_fd, dir_raw] {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        })
+    };
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("dbus.session: xdg-dbus-proxy is not installed (or not in $PATH)")
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("dbus.session: starting xdg-dbus-proxy")),
+    };
+    drop(ready);
+    // One byte once it listens; end of file if it exits first.
+    let mut pfd = libc::pollfd { fd: alive.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let n = unsafe { libc::poll(&mut pfd, 1, DBUS_READY.as_millis() as i32) };
+    let mut b = 0u8;
+    if !(n > 0 && unsafe { libc::read(alive.as_raw_fd(), (&mut b as *mut u8).cast(), 1) } == 1) {
+        let _ = child.kill();
+        let status = child.wait().map(|s| s.to_string()).unwrap_or_default();
+        unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c"bus".as_ptr(), 0) };
+        let why = if n == 0 { format!("was not ready after {}s", DBUS_READY.as_secs()) } else { format!("exited ({status})") };
+        bail!("dbus.session: xdg-dbus-proxy {why}; session bus {}", d.upstream);
+    }
+    let proxy = DbusProxy { child, _alive: alive, socket: dir.path.join("bus"), dir: dir_fd };
+    audit.event(
+        "dbus",
+        json!({"upstream": d.upstream, "socket": d.socket(), "rules": d.rules, "proxy_pid": proxy.child.id()}),
+    );
+    Ok(proxy)
 }
 
 /// Passes pending signals on to the program (through the sandbox's PID 1).

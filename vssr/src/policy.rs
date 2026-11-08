@@ -5,6 +5,7 @@ use crate::util::{expand, expand_path, parse_duration, parse_size, resolve_guard
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use vssb::proxy::NetPolicy;
@@ -69,6 +70,14 @@ wayland = false        # a Wayland socket through a security context, which the 
 # app_id = "org.example.App"   # reported to the compositor
 # insecure_wayland = false     # run even if capture, clipboard or input protocols stay visible
 
+[dbus]
+session = false        # the session bus, only through a filtering xdg-dbus-proxy (the lists below)
+talk = []              # names the program may call, e.g. ["org.freedesktop.Notifications"]; "org.example.*" for a prefix
+own = []               # names it may own, e.g. ["org.example.App"]
+# see = []             # names it may only see
+# call = []            # "NAME=RULE": calls allowed on NAME alone, RULE being [METHOD][@PATH] (see xdg-dbus-proxy(1))
+# broadcast = []       # "NAME=RULE": signals from NAME the program receives
+
 [audit]
 # log = "~/.local/state/vssr/audit.jsonl"
 quiet = false          # true: vssr's messages go only to the log, not to stderr
@@ -86,6 +95,7 @@ pub struct Policy {
     pub detect: DetectCfg,
     pub seccomp: SeccompCfg,
     pub gui: GuiCfg,
+    pub dbus: DbusCfg,
     pub audit: AuditCfg,
 }
 
@@ -314,6 +324,19 @@ pub struct GuiCfg {
     pub insecure_wayland: bool,
 }
 
+/// The session bus through xdg-dbus-proxy's filter; the lists map onto
+/// its `--talk`, `--own`, `--see`, `--call` and `--broadcast`.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct DbusCfg {
+    pub session: bool,
+    pub talk: Vec<String>,
+    pub own: Vec<String>,
+    pub see: Vec<String>,
+    pub call: Vec<String>,
+    pub broadcast: Vec<String>,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuditCfg {
@@ -398,7 +421,10 @@ pub struct Plan {
     pub detected: BTreeMap<PathBuf, String>,
     /// Messages for the user from plan resolution (detection results).
     pub notes: Vec<String>,
+    /// Risks the policy takes on knowingly, for the user (`warning` events).
+    pub warnings: Vec<String>,
     pub wayland: Option<WaylandPlan>,
+    pub dbus: Option<DbusPlan>,
 }
 
 /// Wayland through a security context. The socket itself is made at start
@@ -432,9 +458,9 @@ fn session_wayland() -> Result<PathBuf> {
     Ok(Path::new(&rt).join(name))
 }
 
-/// Adds what Wayland needs to the view: a private runtime directory, and
-/// the session's own socket hidden wherever a bind would show it.
-fn add_wayland(gui: &GuiCfg, uid: u32, compositor: PathBuf, mounts: &mut BTreeMap<PathBuf, Mount>) -> Result<WaylandPlan> {
+/// Makes `/run/user/<uid>` the program's private runtime directory, a
+/// tmpfs for the sockets vssr hands over. `what` names the setting.
+fn private_runtime_dir(uid: u32, what: &str, mounts: &mut BTreeMap<PathBuf, Mount>) -> Result<PathBuf> {
     let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
     // The deepest entry at or above it decides: only a fresh tmpfs (or
     // nothing, the sandbox's own root) can hold the private directory.
@@ -443,18 +469,26 @@ fn add_wayland(gui: &GuiCfg, uid: u32, compositor: PathBuf, mounts: &mut BTreeMa
         && !matches!(m.kind, MountKind::Tmpfs { .. })
     {
         bail!(
-            "gui.wayland makes {} the program's private runtime directory, but the policy's entry for {} covers it; \
+            "{what} makes {} the program's private runtime directory, but the policy's entry for {} covers it; \
              expose host sockets with fs.sockets instead",
             runtime_dir.display(),
             d.display()
         );
     }
-    let real = std::fs::canonicalize(&compositor).unwrap_or_else(|_| compositor.clone());
+    mounts.entry(runtime_dir.clone()).or_insert_with(|| Mount::tmpfs(&runtime_dir));
+    Ok(runtime_dir)
+}
+
+/// Keeps a session socket (`name`, which `what` replaces) out of the view:
+/// an fs.sockets entry for it is refused, and it is hidden wherever a bind
+/// would show it.
+fn hide_session_socket(socket: &Path, name: &str, what: &str, mounts: &mut BTreeMap<PathBuf, Mount>) -> Result<()> {
+    let real = std::fs::canonicalize(socket).unwrap_or_else(|_| socket.to_path_buf());
     let mut denies = Vec::new();
     for m in mounts.values() {
         match &m.kind {
             MountKind::Socket { src } if *src == real => {
-                bail!("fs.sockets hands over the session's Wayland socket {}, which gui.wayland replaces", real.display())
+                bail!("fs.sockets hands over the session's {name} {}, which {what} replaces", real.display())
             }
             MountKind::Bind { src, .. } if real.starts_with(src) && real != *src => {
                 if let Ok(rel) = real.strip_prefix(src) {
@@ -467,8 +501,152 @@ fn add_wayland(gui: &GuiCfg, uid: u32, compositor: PathBuf, mounts: &mut BTreeMa
     for d in denies {
         mounts.entry(d.clone()).or_insert_with(|| Mount::deny(d));
     }
-    mounts.entry(runtime_dir.clone()).or_insert_with(|| Mount::tmpfs(&runtime_dir));
+    Ok(())
+}
+
+/// Adds what Wayland needs to the view: a private runtime directory, and
+/// the session's own socket hidden wherever a bind would show it.
+fn add_wayland(gui: &GuiCfg, uid: u32, compositor: PathBuf, mounts: &mut BTreeMap<PathBuf, Mount>) -> Result<WaylandPlan> {
+    let runtime_dir = private_runtime_dir(uid, "gui.wayland", mounts)?;
+    hide_session_socket(&compositor, "Wayland socket", "gui.wayland", mounts)?;
     Ok(WaylandPlan { compositor, runtime_dir, app_id: gui.app_id.clone(), insecure: gui.insecure_wayland })
+}
+
+/// The session bus through xdg-dbus-proxy. The proxy and its socket are
+/// set up when the run starts (`main.rs`), so the socket isn't among the
+/// mounts.
+#[derive(Debug, Clone)]
+pub struct DbusPlan {
+    /// The session bus's address, as xdg-dbus-proxy gets it.
+    pub upstream: String,
+    /// The socket files that address names (none for an abstract one).
+    pub host_sockets: Vec<PathBuf>,
+    /// The private runtime directory inside, which holds the socket as `bus`.
+    pub runtime_dir: PathBuf,
+    /// The filter: `--talk=…`, `--own=…` and the rest, in policy order.
+    pub rules: Vec<String>,
+}
+
+impl DbusPlan {
+    /// Where the program finds the socket.
+    pub fn socket(&self) -> PathBuf {
+        self.runtime_dir.join("bus")
+    }
+
+    /// `DBUS_SESSION_BUS_ADDRESS` inside.
+    pub fn address(&self) -> String {
+        format!("unix:path={}", self.socket().display())
+    }
+}
+
+/// The session bus's address: `$DBUS_SESSION_BUS_ADDRESS`, or the socket
+/// systemd and dbus-broker use, `$XDG_RUNTIME_DIR/bus`.
+fn session_bus() -> Result<String> {
+    if let Ok(a) = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        && !a.is_empty()
+    {
+        return Ok(a);
+    }
+    let rt = std::env::var("XDG_RUNTIME_DIR").context("dbus.session: neither $DBUS_SESSION_BUS_ADDRESS nor $XDG_RUNTIME_DIR is set")?;
+    Ok(format!("unix:path={}", Path::new(&rt).join("bus").display()))
+}
+
+/// The socket paths a D-Bus address names (`unix:path=…` entries,
+/// `%XX` escapes decoded). Abstract sockets have none, and Landlock keeps
+/// the sandbox from reaching those outside it.
+fn bus_socket_paths(address: &str) -> Vec<PathBuf> {
+    let unescape = |v: &str| -> Option<Vec<u8>> {
+        let b = v.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        Some(out)
+    };
+    let mut paths = vec![];
+    for entry in address.split(';') {
+        let Some(params) = entry.strip_prefix("unix:") else { continue };
+        for kv in params.split(',') {
+            if let Some(v) = kv.strip_prefix("path=")
+                && let Some(p) = unescape(v)
+            {
+                paths.push(PathBuf::from(std::ffi::OsString::from_vec(p)));
+            }
+        }
+    }
+    paths
+}
+
+/// A well-known bus name (`org.example.App`), or a prefix of them
+/// (`org.example.*`), as xdg-dbus-proxy takes them.
+fn bus_name_ok(name: &str) -> bool {
+    let base = name.strip_suffix(".*").unwrap_or(name);
+    let elements: Vec<&str> = base.split('.').collect();
+    base.len() <= 255
+        && elements.len() >= 2
+        && elements.iter().all(|e| {
+            let mut c = e.chars();
+            c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_' || f == '-')
+                && c.all(|x| x.is_ascii_alphanumeric() || x == '_' || x == '-')
+        })
+}
+
+/// Services known to run commands on the host for any caller that may
+/// talk to them.
+const BUS_ESCAPES: [&str; 2] = ["org.freedesktop.systemd1", "org.freedesktop.Flatpak"];
+
+/// Whether a name or prefix in the filter reaches `name`.
+fn bus_name_covers(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix(".*") {
+        Some(prefix) => name == prefix || name.strip_prefix(prefix).is_some_and(|r| r.starts_with('.')),
+        None => pattern == name,
+    }
+}
+
+/// Adds the session bus to the view (a private runtime directory, the
+/// session's own socket hidden) and turns the policy's lists into the
+/// proxy's filter.
+fn add_dbus(cfg: &DbusCfg, uid: u32, upstream: String, mounts: &mut BTreeMap<PathBuf, Mount>, warnings: &mut Vec<String>) -> Result<DbusPlan> {
+    let mut rules = vec![];
+    for (key, list) in [("see", &cfg.see), ("talk", &cfg.talk), ("own", &cfg.own)] {
+        for n in list {
+            if !bus_name_ok(n) {
+                bail!("dbus.{key} {n:?}: not a D-Bus name (such as org.example.App, or org.example.* for a prefix)");
+            }
+            rules.push(format!("--{key}={n}"));
+        }
+    }
+    for (key, list) in [("call", &cfg.call), ("broadcast", &cfg.broadcast)] {
+        for r in list {
+            let ok = r.split_once('=').is_some_and(|(n, rule)| {
+                bus_name_ok(n) && !rule.is_empty() && rule.chars().all(|c| c.is_ascii_alphanumeric() || "_-.*@/".contains(c))
+            });
+            if !ok {
+                bail!("dbus.{key} {r:?}: expected NAME=RULE, RULE being [METHOD][@PATH] (such as org.example.App=org.example.App.Open@/org/example/App)");
+            }
+            rules.push(format!("--{key}={r}"));
+        }
+    }
+    for esc in BUS_ESCAPES {
+        if let Some(n) = cfg.talk.iter().chain(&cfg.own).find(|n| bus_name_covers(n, esc)) {
+            let via = if n == esc { String::new() } else { format!(" (through {n})") };
+            warnings.push(format!("dbus: the program may talk to {esc}{via}, which can run any command on the host"));
+        }
+    }
+    let runtime_dir = private_runtime_dir(uid, "dbus.session", mounts)?;
+    let host_sockets = bus_socket_paths(&upstream);
+    for p in &host_sockets {
+        hide_session_socket(p, "bus socket", "dbus.session", mounts)?;
+    }
+    Ok(DbusPlan { upstream, host_sockets, runtime_dir, rules })
 }
 
 /// Extra filesystem entries from the command line; they override the policy.
@@ -591,6 +769,22 @@ impl Plan {
             }
             None
         };
+        let mut warnings = vec![];
+        let d = &policy.dbus;
+        let dbus = if d.session {
+            if uid != host_uid {
+                bail!(
+                    "dbus.session needs the program's uid to be yours ({host_uid}, not sandbox.uid = {uid}): \
+                     the bus checks the uid a client claims against the one it connects as"
+                );
+            }
+            Some(add_dbus(d, uid, session_bus()?, &mut mounts, &mut warnings)?)
+        } else {
+            if [&d.talk, &d.own, &d.see, &d.call, &d.broadcast].iter().any(|l| !l.is_empty()) {
+                bail!("the dbus lists only apply with dbus.session = true");
+            }
+            None
+        };
 
         if mounts.keys().any(|d| d == Path::new("/")) {
             bail!("'/' cannot be bound directly; list the directories to expose instead");
@@ -631,8 +825,18 @@ impl Plan {
             env.retain(|(k, _)| k != "WAYLAND_DISPLAY" && k != "XDG_RUNTIME_DIR");
             env.push(("WAYLAND_DISPLAY".into(), "wayland-0".into()));
             env.push(("XDG_RUNTIME_DIR".into(), w.runtime_dir.to_string_lossy().into_owned()));
-            env.sort();
         }
+        if let Some(d) = &dbus {
+            env.retain(|(k, _)| k != "DBUS_SESSION_BUS_ADDRESS" && k != "XDG_RUNTIME_DIR");
+            env.push(("DBUS_SESSION_BUS_ADDRESS".into(), d.address()));
+            env.push(("XDG_RUNTIME_DIR".into(), d.runtime_dir.to_string_lossy().into_owned()));
+            // The accessibility bus is reached through the session bus, and
+            // isn't in the filter unless the policy says so.
+            if !env.iter().any(|(k, _)| k == "NO_AT_BRIDGE") {
+                env.push(("NO_AT_BRIDGE".into(), "1".into()));
+            }
+        }
+        env.sort();
 
         let limits = &policy.limits;
         if let Some(c) = limits.cpus
@@ -692,7 +896,9 @@ impl Plan {
             writable,
             detected,
             notes,
+            warnings,
             wayland,
+            dbus,
         })
     }
 
@@ -845,7 +1051,15 @@ impl Plan {
                     "insecure": w.insecure,
                 })),
             },
+            "dbus": {
+                "session": self.dbus.as_ref().map(|d| json!({
+                    "upstream": d.upstream,
+                    "socket": d.socket(),
+                    "rules": d.rules,
+                })),
+            },
             "notes": self.notes,
+            "warnings": self.warnings,
         })
     }
 
@@ -892,6 +1106,10 @@ impl Plan {
             let insecure = if w.insecure { " (insecure_wayland: runs even if escape protocols are visible)" } else { "" };
             let _ = writeln!(s, "wayland:  {} through a security context{app}, as {}{insecure}", w.compositor.display(), w.socket().display());
         }
+        if let Some(d) = &self.dbus {
+            let rules = if d.rules.is_empty() { "nothing but the bus itself".into() } else { d.rules.join(" ") };
+            let _ = writeln!(s, "dbus:     {} through xdg-dbus-proxy, as {}; allows {rules}", d.upstream, d.socket().display());
+        }
         let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
         let _ = writeln!(s, "env:      {}", names.join(" "));
         let mut lim = vec![];
@@ -908,6 +1126,9 @@ impl Plan {
         let _ = writeln!(s, "strict:   {}  tty: {}", self.strict, self.tty);
         for n in &self.notes {
             let _ = writeln!(s, "note:     {n}");
+        }
+        for w in &self.warnings {
+            let _ = writeln!(s, "warning:  {w}");
         }
         s
     }
@@ -1252,6 +1473,81 @@ mod tests {
         assert!(view(&[Mount::ro_at(base.join("rt"), "/run/user/1000")]).is_err());
         assert!(view(&[Mount::socket_at(&session, "/s")]).is_err());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn dbus_view() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("vssr-bus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("rt")).unwrap();
+        let bus = base.join("rt/bus");
+        let _l = std::os::unix::net::UnixListener::bind(&bus).unwrap();
+        let upstream = format!("unix:path={},guid=0123", bus.display());
+        let view = |cfg: &DbusCfg, entries: &[Mount]| {
+            let mut m: BTreeMap<PathBuf, Mount> = entries.iter().map(|e| (e.dest.clone(), e.clone())).collect();
+            let mut warnings = vec![];
+            add_dbus(cfg, 1000, upstream.clone(), &mut m, &mut warnings).map(|d| (d, m, warnings))
+        };
+        let cfg = DbusCfg {
+            session: true,
+            talk: vec!["org.freedesktop.Notifications".into(), "org.freedesktop.portal.*".into()],
+            own: vec!["org.example.App".into()],
+            call: vec!["org.example.Other=org.example.Other.Open@/org/example/*".into()],
+            ..Default::default()
+        };
+        let (d, m, notes) = view(&cfg, &[Mount::tmpfs("/run"), Mount::ro_at(base.join("rt"), "/hostrun")]).unwrap();
+        assert_eq!(d.socket(), Path::new("/run/user/1000/bus"));
+        assert_eq!(d.address(), "unix:path=/run/user/1000/bus");
+        assert_eq!(
+            d.rules,
+            [
+                "--talk=org.freedesktop.Notifications",
+                "--talk=org.freedesktop.portal.*",
+                "--own=org.example.App",
+                "--call=org.example.Other=org.example.Other.Open@/org/example/*"
+            ]
+        );
+        assert!(notes.is_empty());
+        assert!(matches!(m[Path::new("/run/user/1000")].kind, MountKind::Tmpfs { .. }));
+        // The session's socket is hidden wherever a bind shows it, and can't be handed over.
+        assert_eq!(m[Path::new("/hostrun/bus")].kind, MountKind::Deny);
+        assert!(view(&cfg, &[Mount::socket_at(&bus, "/s")]).is_err());
+        assert!(view(&cfg, &[Mount::ro("/run")]).is_err());
+        // Names are checked, and services that run host commands are pointed out.
+        for bad in ["org", "org.*", "org..x", "1org.x", "org.x y", ":1.5", "org.x.**"] {
+            assert!(view(&DbusCfg { session: true, talk: vec![bad.into()], ..Default::default() }, &[]).is_err(), "{bad}");
+        }
+        for bad in ["org.x", "org.x=", "org.x=a b", "org.x=a\n"] {
+            assert!(view(&DbusCfg { session: true, call: vec![bad.into()], ..Default::default() }, &[]).is_err(), "{bad}");
+        }
+        for talk in ["org.freedesktop.systemd1", "org.freedesktop.*"] {
+            let (_, _, notes) = view(&DbusCfg { session: true, talk: vec![talk.into()], ..Default::default() }, &[]).unwrap();
+            assert!(notes.iter().any(|n| n.contains("org.freedesktop.systemd1")), "{talk}");
+        }
+        let (_, _, notes) = view(&DbusCfg { session: true, talk: vec!["org.freedesktop.systemd10".into()], ..Default::default() }, &[]).unwrap();
+        assert!(notes.is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn bus_addresses() {
+        assert_eq!(bus_socket_paths("unix:path=/run/user/1/bus"), [PathBuf::from("/run/user/1/bus")]);
+        assert_eq!(bus_socket_paths("unix:guid=1,path=/a%20b/bus;tcp:host=x"), [PathBuf::from("/a b/bus")]);
+        assert_eq!(bus_socket_paths("unix:abstract=/tmp/dbus-x,guid=2"), Vec::<PathBuf>::new());
+        assert_eq!(bus_socket_paths("unix:path=/bad%2"), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn dbus_needs_the_session_and_your_uid() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let mut p = Policy::default_policy();
+        p.dbus.talk = vec!["org.example.App".into()];
+        let err = Plan::build(&p, &FsOverrides::default(), &dir).unwrap_err();
+        assert!(err.to_string().contains("dbus.session = true"), "{err}");
+        p.dbus.session = true;
+        p.sandbox.uid = Some(unsafe { libc::getuid() } + 1);
+        let err = Plan::build(&p, &FsOverrides::default(), &dir).unwrap_err();
+        assert!(err.to_string().contains("sandbox.uid"), "{err}");
     }
 
     #[test]

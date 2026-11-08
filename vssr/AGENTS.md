@@ -11,10 +11,11 @@ into a `vssb::Sandbox` and `vssb::Command`.
 
 ## Layout
 
-- `src/main.rs`: CLI, policy overrides, supervisor (creates the Wayland
-  security context, spawns the sandbox, serves the proxy, forwards
-  signals from a signalfd, timeout, audit events), all on one thread
-  apart from the proxy's.
+- `src/main.rs`: CLI, policy overrides, supervisor (creates the run
+  directory, the Wayland security context and the xdg-dbus-proxy,
+  spawns the sandbox, serves the proxy, forwards signals from a
+  signalfd, timeout, audit events), all on one thread apart from the
+  proxy's.
 - `src/policy.rs`: TOML policy and its resolution into a `Plan` (mount
   list as `vssb::Mount`s sorted parent-first, env, net, limits), and
   `Plan::sandbox`/`Plan::command`, which map it onto vssb.
@@ -60,6 +61,10 @@ into a `vssb::Sandbox` and `vssb::Command`.
   quiet), never straight to stderr once the log is open.
 - The forwarded signals are blocked before the sandbox or any proxy
   thread starts, so only the signalfd receives them.
+- xdg-dbus-proxy is forked before any thread starts, and gets only its
+  `--fd` pipe and the run directory's descriptor (everything else is
+  close-on-exec). It binds its socket through that descriptor, never by
+  a path from the host's environment.
 - vssb's own invariants (fork safety of the child, mount-point lookup,
   seccomp last) are listed in its AGENTS.md.
 
@@ -69,7 +74,8 @@ into a `vssb::Sandbox` and `vssb::Command`.
 the proxy tests and a systemd user manager for the limit tests; the
 Wayland tests need `VSSR_TEST_WAYLAND` naming a headless compositor, and
 the script unsets `WAYLAND_DISPLAY` so nothing else reaches the live
-session). Add an
+session; the D-Bus tests start their own bus, and make only a read-only
+call to the session bus). Add an
 integration test for every new guarantee; guarantees of the sandbox
 itself also get one in vssb's `tests/sandbox.rs`.
 

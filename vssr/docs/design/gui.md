@@ -2,8 +2,9 @@
 
 Status: proposal, 2026-11-05. Implemented so far: the prototype of the
 Wayland decision gate (1), run on sway and Hyprland on 2026-11-07 (it
-passes on both), then `fs.sockets` (2) and Wayland through a security
-context with the check at every start (1), both on 2026-11-07. Part of
+passes on both), then `fs.sockets` (2), Wayland through a security
+context with the check at every start (1) and D-Bus through
+xdg-dbus-proxy (3), all on 2026-11-07. Part of
 the general-purpose direction in [ergonomics.md](ergonomics.md).
 
 ## Problem
@@ -235,6 +236,28 @@ xdg-dbus-proxy "$DBUS_SESSION_BUS_ADDRESS" $XDG_RUNTIME_DIR/vssr/<id>/bus \
 - Profiles should prefer portals (`org.freedesktop.portal.*`) over
   talking to services directly.
 
+Built on 2026-11-07 as above, with these choices:
+
+- Enabled by `dbus.session = true` (`--dbus`, implied by `--dbus-talk`,
+  `--dbus-own` and `--dbus-see`); the lists without it are an error.
+  `session` leaves room for a filtered system bus later.
+- The proxy binds its socket through `/proc/self/fd/N/bus`, N being the
+  run directory it inherits, so no symlink on the way is followed (as
+  with the Wayland socket). It gets that descriptor and the `--fd` pipe
+  and nothing else of vssr's, runs in its own process group (the
+  terminal's Ctrl-C is the program's), and stops when the pipe's read
+  end closes, so with vssr however it ends. No `PR_SET_PDEATHSIG`: its
+  SIGKILL beat the pipe and left the socket behind, which the proxy
+  removes when it stops by itself.
+- Names are checked against D-Bus syntax (optionally with `.*`), call and
+  broadcast rules against xdg-dbus-proxy's `[METHOD][@PATH]`.
+- `talk` or `own` reaching `org.freedesktop.systemd1` or
+  `org.freedesktop.Flatpak` gives a warning at start, not a refusal.
+- A `sandbox.uid` other than the host uid is refused: the client claims
+  its own uid in the `EXTERNAL` handshake and the bus compares it with
+  the proxy's, so the program would only hang.
+- `NO_AT_BRIDGE=1` is set unless the policy sets it.
+
 ## 4. X11 only through a private Xwayland
 
 No access to the session's X server. For apps that need X11, the
@@ -309,7 +332,7 @@ To explore (unverified):
    Done on 2026-11-07.
 2. Wayland through a security context, with the check at every start (1).
    Done on 2026-11-07.
-3. `xdg-dbus-proxy` and `[dbus]` (3).
+3. `xdg-dbus-proxy` and `[dbus]` (3). Done on 2026-11-07.
 4. Per-app home, environment, `XDG_RUNTIME_DIR`, fonts and themes; two
    or three example profiles in `examples/` (6).
 5. `gpu` and `audio` (5).
@@ -328,9 +351,11 @@ running:
   `VSSR_TEST_WAYLAND`; the refusal itself only has a unit test, since
   neither sway nor Hyprland leaks.)
 - The session's own Wayland socket and the session bus are unreachable
-  inside. (The Wayland half in place since 2026-11-07.)
+  inside. (In place since 2026-11-07.)
 - Through the D-Bus proxy, `org.freedesktop.systemd1` can't be called;
-  an allowed name can.
+  an allowed name can. (In place since 2026-11-07, on a private bus with
+  `dbus-test-tool` services, plus a read-only call to the session bus's
+  systemd.)
 - Only sockets listed in `fs.sockets` can be connected to; another
   socket in the same directory can't. (In place since 2026-11-07, in
   both test suites.)

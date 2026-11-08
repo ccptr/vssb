@@ -37,6 +37,8 @@ resolves.
 - Unprivileged user namespaces enabled (the default on most distributions;
   Ubuntu 24.04+ restricts them through AppArmor and needs a profile).
 - x86_64 or aarch64.
+- For `--dbus`: `xdg-dbus-proxy` (packaged on its own by most
+  distributions).
 - For a memory limit: a systemd user manager, or a cgroup
   you prepared (`--cgroup`). Without either,
   `cpus` pins the sandbox to that many CPUs and `pids` sizes its PID
@@ -59,6 +61,8 @@ vssr run [OPTIONS] -- COMMAND [ARGS...]
       --socket PATH      let the program connect to this host unix socket (SRC or SRC:DEST)
       --wayland          a Wayland socket through a security context (see below)
       --app-id ID        the app id the compositor gets (with --wayland)
+      --dbus             the session bus through a filter (see below)
+      --dbus-talk NAME   a bus name the program may call (implies --dbus; also --dbus-own, --dbus-see)
       --net none|proxy|host
       --allow HOST       allow through the proxy (implies --net proxy)
       --timeout 30m      --memory 4G   --cpus 2   --pids 512
@@ -152,6 +156,14 @@ wayland = true          # a Wayland socket through a security context
 app_id = "org.example.App"   # reported to the compositor
 insecure_wayland = false     # run even if capture, clipboard or input protocols stay visible
 
+[dbus]
+session = true          # the session bus, through xdg-dbus-proxy's filter
+talk = ["org.freedesktop.Notifications"]   # names it may call; "org.example.*" for a prefix
+own = ["org.example.App"]                  # names it may own
+see = []                # names it may only see
+call = []               # "NAME=RULE": calls allowed on NAME alone (RULE is [METHOD][@PATH])
+broadcast = []          # "NAME=RULE": signals from NAME it receives
+
 [audit]
 log = "~/.local/state/vssr/audit.jsonl"
 quiet = false           # vssr's messages (notes, warnings, blocked requests) only in the log
@@ -232,8 +244,31 @@ hidden wherever a bind would show it. The compositor sees the windows
 with sandbox engine `vssr`, the `app_id` and the run id. On the host the
 socket lives in `$XDG_RUNTIME_DIR/vssr/<id>/` and is removed when the
 run ends; the compositor stops accepting on it as soon as vssr exits.
-There is no X11 access (`DISPLAY` isn't passed, `/tmp` is fresh), no
-D-Bus and no audio yet.
+There is no X11 access (`DISPLAY` isn't passed, `/tmp` is fresh) and no
+audio yet.
+
+**D-Bus.** The sandbox never sees the session bus itself. With
+`dbus.session` (`--dbus`, or any of `--dbus-talk`, `--dbus-own`,
+`--dbus-see`), vssr starts `xdg-dbus-proxy` outside the sandbox, as
+Flatpak does, on the bus at `$DBUS_SESSION_BUS_ADDRESS` (default
+`$XDG_RUNTIME_DIR/bus`) with `--filter` and the `[dbus]` lists as its
+`--talk`, `--own`, `--see`, `--call` and `--broadcast` rules. Names the
+filter doesn't let through don't exist as far as the program can tell:
+calls to them fail as if no one owned them, and they are left out of
+`ListNames`. The program can always talk to the bus itself; nothing at
+all is the filter with empty lists. Inside it gets a private
+`/run/user/<uid>` tmpfs (shared with Wayland's) holding the proxy's
+socket as `bus`, with `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
+set to match, and `NO_AT_BRIDGE=1` unless the policy sets it (the
+accessibility bus is reached through the session bus); the session's own
+socket is hidden wherever a bind would show it. vssr waits until the
+proxy accepts connections before starting the program, stops it and
+removes its socket (in `$XDG_RUNTIME_DIR/vssr/<id>/`) when the run ends,
+and the proxy stops by itself if vssr dies. The program's uid must be
+yours (no `sandbox.uid`): the bus checks the uid a client claims. Names
+in `talk` or `own` that reach `org.freedesktop.systemd1` or
+`org.freedesktop.Flatpak`, which run commands on the host, give a
+warning at start. There is no system bus.
 
 **Driving vssr from another program.** `--audit-fd N` writes the events
 to a descriptor the caller passed in (a pipe, socket or file), with no
@@ -246,8 +281,9 @@ set) and `event`:
 | `note` | something detection left out, and why (`text`) |
 | `start` | the program has been exec'd: the ready event (`host_pid`, `limits`, …) |
 | `setup_failed` | the sandbox couldn't be set up or the program not run (`code`, `error`); no `start` follows |
-| `warning` | a limit isn't in effect (`limit`, `text`), or `insecure_wayland` let escape protocols through (`wayland_escapes`) |
+| `warning` | a limit isn't in effect (`limit`, `text`), `insecure_wayland` let escape protocols through (`wayland_escapes`), or a D-Bus name reaches a service that runs host commands (`text`) |
 | `wayland` | the security context is in place (`compositor`, `app_id`, `globals` offered through it, `escapes`) |
+| `dbus` | the D-Bus proxy accepts connections (`upstream`, `socket`, `rules`, `proxy_pid`) |
 | `net`, `net_close` | each proxied connection: allowed, denied or failed, then its byte counts |
 | `signal` | a signal passed on to the program |
 | `timeout` | the timeout hit; SIGTERM, then SIGKILL after `kill_grace` |
@@ -323,6 +359,14 @@ Think about what you expose, not only what you block.
   idle notifier (it tells the app when you are away) stays visible, and
   on Hyprland the keyboard-shortcuts inhibitor too (a focused window can
   take the compositor's key bindings).
+- With `--dbus`, each name in `talk` is a capability, like a socket:
+  the program can do whatever that service does for callers. Many
+  session services amount to running commands as you
+  (`org.freedesktop.systemd1`, `org.freedesktop.Flatpak`, and dconf
+  (`ca.desrt.dconf`), whose settings include commands that run later),
+  and a prefix such as `org.freedesktop.*` reaches all of them. Prefer
+  portals (`org.freedesktop.portal.Desktop`) and the specific names an
+  app needs.
 - `--tty` keeps your terminal attached so interactive tools work.
   TIOCSTI is blocked, but the agent can still print escape sequences to
   your terminal; prefer non-tty mode for unattended runs. Ctrl-C and
@@ -378,7 +422,10 @@ The integration tests need internet access for the proxy tests
 limit tests. The Wayland tests run only with `VSSR_TEST_WAYLAND` naming
 a headless compositor's socket, never the live session's, for example a
 sway started with `WLR_BACKENDS=headless WLR_RENDERER=pixman sway -c
-/dev/null` (it takes the next free `wayland-N`).
+/dev/null` (it takes the next free `wayland-N`). The D-Bus tests start
+their own bus with `dbus-daemon` and stand-in services with
+`dbus-test-tool`; the only call to the session bus is a read-only one to
+systemd, which must fail inside.
 
 ## License
 

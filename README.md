@@ -74,11 +74,13 @@ full.
   reads the policy from a pipe, `--pass-fd` hands the program a
   descriptor such as a pre-connected socket, and `--cgroup` uses a cgroup
   you prepared.
-- **Single sockets and Wayland.** `--socket` hands over one host unix
-  socket (an `ssh-agent`, a build daemon) and nothing else in its
+- **Single sockets, Wayland and D-Bus.** `--socket` hands over one host
+  unix socket (an `ssh-agent`, a build daemon) and nothing else in its
   directory. `--wayland` gives a GUI program a Wayland socket through a
   security context, so the compositor hides screen capture, the clipboard
   and input injection from it; vssr checks that it does before starting.
+  `--dbus-talk NAME` gives it the session bus through xdg-dbus-proxy's
+  filter, which lets it reach only the names it is allowed.
 
 ## Requirements
 
@@ -109,7 +111,9 @@ its argument), so build first. It needs network access for the proxy tests
 (`VSSR_TEST_OFFLINE=1` skips them). Tests of limits through a systemd
 scope are skipped without a systemd user manager. The Wayland tests run
 only with `VSSB_TEST_WAYLAND` / `VSSR_TEST_WAYLAND` naming a headless
-compositor's socket.
+compositor's socket. The D-Bus tests start a private bus (they need
+`dbus-daemon`, `dbus-test-tool` and `xdg-dbus-proxy`), apart from one
+read-only call to the session bus's systemd.
 
 ## Documentation
 
