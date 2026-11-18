@@ -17,6 +17,8 @@ the policy model, what passes, and how it differs from xdg-dbus-proxy.
 - `src/names.rs`: name syntax. `src/auth.rs`: both logins and bus
   addresses. `src/conn.rs`: one connection's sockets (`poll`, `recvmsg`
   with descriptors, queues).
+- `src/differential.rs`: the differential test against xdg-dbus-proxy
+  (an ignored test).
 - `examples/proxy.rs`: the proxy by hand. `tests/proxy.rs`, `tests/peer.py`:
   end to end on a private bus.
 
@@ -42,6 +44,10 @@ the policy model, what passes, and how it differs from xdg-dbus-proxy.
 
 `cargo test -p dbus-proxy`. Every filter rule gets a case in `filter::tests`;
 anything that depends on a real client library or bus gets one in
-`tests/proxy.rs`. Tests use only their private `dbus-daemon`, never the
+`tests/proxy.rs`. After a change to the filter, run the differential
+test against xdg-dbus-proxy (README, "Against xdg-dbus-proxy") for a few
+thousand rounds; a new difference is either a bug or, when it is
+deliberate and this proxy is the stricter, an entry in `known` and the
+README. Tests use only their private `dbus-daemon`, never the
 session bus; try the session bus by hand only read-only (the example
 proxy with `--see`, then `ListNames` or a property read).

@@ -51,14 +51,15 @@ that sent it something.
 
 The bus's own methods: `Hello`, `GetId`, `AddMatch` (not with
 `eavesdrop`), `RemoveMatch`, `ListNames` and `ListActivatableNames`
-(filtered replies), the `Peer`, `Introspectable` and read-only
-`Properties` methods pass. `RequestName`, `ReleaseName` and
-`ListQueuedOwners` need `own` on the name; `NameHasOwner`,
-`GetNameOwner` and the `GetConnection*` credential methods need `see`
-(otherwise the answer is that nothing owns it); `StartServiceByName`
-needs `talk`. Everything else (`BecomeMonitor`,
-`UpdateActivationEnvironment`, `ReloadConfig`, the `Debug.Stats` and
-`Containers1` interfaces, anything newer) is refused.
+(filtered replies) and `Introspect` pass. `RequestName`, `ReleaseName`
+and `ListQueuedOwners` need `own` on the name; `NameHasOwner`,
+`GetNameOwner` and the `GetConnection*` credential methods need `see`;
+`StartServiceByName` needs `talk`. About a hidden name they answer as
+xdg-dbus-proxy does: `NameHasOwner` false, `GetNameOwner`
+`NameHasNoOwner`, the others `ServiceUnknown`. Everything else
+(`BecomeMonitor`, `UpdateActivationEnvironment`, `ReloadConfig`, the
+bus's `Peer` and `Properties` interfaces, `Debug.Stats`, `Containers1`,
+anything newer) is refused.
 
 Coming in: replies only to the program's calls in flight; broadcasts only
 from senders the policy lets through; messages the bus addresses to the
@@ -82,8 +83,13 @@ so they can't be forged).
 - **It runs in the caller**, one thread to accept and one per connection,
   with no helper binary.
 - **It is stricter** about headers (below), refuses method calls with no
-  destination and `ReloadConfig`, and drops messages that carry
-  descriptors towards a program that didn't negotiate them.
+  destination and `ReloadConfig`, refuses any match rule that mentions
+  `eavesdrop` (xdg-dbus-proxy looks for `eavesdrop=`), and drops messages
+  that carry descriptors towards a program that didn't negotiate them.
+- **A unique name's level follows what it owns now.** xdg-dbus-proxy
+  keeps the level a service's unique name earned from a well-known name
+  after the service gives that name up (it stays visible, callable, and
+  its broadcasts keep arriving); here it goes with the name.
 - No `--sloppy-names` and no `--log` (events replace it).
 
 ## Messages
@@ -133,3 +139,35 @@ and the filter (as a state machine, message by message), and
 descriptors and broadcasts, `tests/peer.py`), sd-bus (`busctl`) and
 libdbus (`dbus-send`, `dbus-monitor`) clients through the proxy. Tests
 whose tools are missing say so and pass.
+
+### Against xdg-dbus-proxy
+
+```sh
+cargo test -p dbus-proxy --lib differential -- --ignored --nocapture
+DIFF_SEED=… DIFF_ROUND=… cargo test …     # replay one round
+```
+
+`src/differential.rs` builds two identical worlds per round, each a
+private `dbus-daemon` with the same four services, one behind
+xdg-dbus-proxy and one behind this proxy, with the same random policy
+(xdg-dbus-proxy's arguments). It then plays the same random actions in
+both: calls (to well-known and unique names, the program itself, names
+that don't exist, with and without interfaces and flags), every bus
+method, match rules (eavesdropping ones too), the program's broadcasts,
+unicast signals and stray replies; the services' broadcasts, calls to
+the program (answered once or twice), calls between services, and names
+changing owner. After each action it compares what the program got
+(reply or error name, bodies that don't depend on the bus, signals,
+calls) and what each service got from it. A round stops at its first
+difference. The two kinds above, where this proxy is the stricter, are
+counted as known; any other difference fails with the policy and the
+actions that led to it (`DIFF_ROUNDS`, default 40, from `DIFF_FROM`, 0,
+and `DIFF_ACTIONS`, 25; it needs `xdg-dbus-proxy`). A round takes about
+two seconds.
+
+On 2026-11-07 and 08, 3900 rounds (seeds 1, 7, 11 and 2026) found two
+differences, both since fixed: this proxy let the bus's `Peer` and
+`Properties` methods through, which xdg-dbus-proxy refuses, and it
+answered bus methods about hidden names with other errors. Every other
+difference was one of the two known kinds. Nothing reached a service,
+or the program, through this proxy that didn't through xdg-dbus-proxy.

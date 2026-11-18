@@ -26,6 +26,8 @@
 
 mod auth;
 mod conn;
+#[cfg(test)]
+mod differential;
 mod filter;
 mod names;
 mod policy;

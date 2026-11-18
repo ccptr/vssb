@@ -220,7 +220,7 @@ fn talk_see_hide_and_own() {
     for want in [
         "call org.dbusproxy.Other.Hi to org.dbusproxy.Other at /: name not visible",
         "call org.dbusproxy.Seen.Hi to org.dbusproxy.Seen at /: not allowed",
-        "call org.freedesktop.DBus.RequestName(org.dbusproxy.Allowed2) to org.freedesktop.DBus at /org/freedesktop/DBus: may not own the name",
+        "call org.freedesktop.DBus.RequestName(org.dbusproxy.Allowed2) to org.freedesktop.DBus at /org/freedesktop/DBus: name not visible",
     ] {
         assert!(denied.iter().any(|d| d == want), "{want:?} not in {denied:#?}");
     }

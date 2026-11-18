@@ -527,6 +527,15 @@ impl Message {
         (0..n).map(|_| r.string().ok()).collect()
     }
 
+    /// The first argument, when it is a `u` or `b`.
+    #[cfg(test)]
+    pub fn arg0_u32(&self) -> Option<u32> {
+        if !matches!(self.signature.as_bytes().first(), Some(b'u' | b'b')) {
+            return None;
+        }
+        self.body().u32().ok()
+    }
+
     pub fn arg0(&self) -> Option<&str> {
         self.strings(1).map(|v| v[0])
     }
@@ -568,7 +577,7 @@ pub struct Body {
 }
 
 impl Body {
-    fn pad(&mut self, a: usize) {
+    pub fn pad(&mut self, a: usize) {
         self.b.resize(align(self.b.len(), a), 0);
     }
 

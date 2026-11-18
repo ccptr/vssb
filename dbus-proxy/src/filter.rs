@@ -217,9 +217,7 @@ impl Filter {
         };
         match (iface, member) {
             (BUS, "Hello" | "GetId" | "RemoveMatch")
-            | ("org.freedesktop.DBus.Introspectable", "Introspect")
-            | ("org.freedesktop.DBus.Peer", "Ping" | "GetMachineId")
-            | ("org.freedesktop.DBus.Properties", "Get" | "GetAll") => self.forward(m, Reply::Normal, out),
+            | ("org.freedesktop.DBus.Introspectable", "Introspect") => self.forward(m, Reply::Normal, out),
             (BUS, "ListNames" | "ListActivatableNames") => self.forward(m, Reply::Names, out),
             (BUS, "AddMatch") => match &arg0 {
                 Some(rule) if !rule.contains("eavesdrop") => self.forward(m, Reply::Normal, out),
@@ -228,8 +226,10 @@ impl Filter {
             (BUS, "RequestName" | "ReleaseName" | "ListQueuedOwners") => {
                 if needs(Level::Own) {
                     self.forward(m, Reply::Normal, out)
-                } else {
+                } else if needs(Level::See) {
                     self.refuse(&m, Reason::NotOwner, arg0.clone(), out)
+                } else {
+                    self.refuse(&m, Reason::Hidden, arg0.clone(), out)
                 }
             }
             (BUS, "NameHasOwner") => {
@@ -243,14 +243,20 @@ impl Filter {
             }
             (
                 BUS,
-                "GetNameOwner"
-                | "GetConnectionUnixUser"
+                "GetConnectionUnixUser"
                 | "GetConnectionUnixProcessID"
                 | "GetConnectionCredentials"
                 | "GetAdtAuditSessionData"
                 | "GetConnectionSELinuxSecurityContext"
                 | "GetConnectionAppArmorSecurityContext",
             ) => {
+                if needs(Level::See) {
+                    self.forward(m, Reply::Normal, out)
+                } else {
+                    self.refuse(&m, Reason::Hidden, arg0.clone(), out)
+                }
+            }
+            (BUS, "GetNameOwner") => {
                 if needs(Level::See) {
                     return self.forward(m, Reply::Normal, out);
                 }
@@ -310,8 +316,11 @@ impl Filter {
             return Ok(());
         }
         let what = name.or_else(|| m.destination.clone()).unwrap_or_default();
+        // As xdg-dbus-proxy answers: by the message's destination, so a bus
+        // method about a hidden name gets ServiceUnknown.
+        let unique_dest = m.destination.as_deref().is_some_and(|d| d.starts_with(':'));
         let (error, text) = match reason {
-            Reason::Hidden if what.starts_with(':') || m.flags & NO_AUTO_START != 0 => {
+            Reason::Hidden if unique_dest || m.flags & NO_AUTO_START != 0 => {
                 (NAME_HAS_NO_OWNER, format!("The name {what} does not exist"))
             }
             Reason::Hidden => (SERVICE_UNKNOWN, format!("The name {what} was not provided by any .service files")),
@@ -732,8 +741,11 @@ mod tests {
         assert_eq!(t.try_call(bus(10, "StartServiceByName", &["org.example.Look"])), ACCESS_DENIED);
         assert_eq!(t.try_call(bus(11, "StartServiceByName", &["org.example.Gone"])), SERVICE_UNKNOWN);
         assert_eq!(t.try_call(bus(12, "GetConnectionUnixProcessID", &[":1.2"])), "pass");
-        assert_eq!(t.try_call(bus(13, "GetConnectionUnixProcessID", &[":1.1"])), NAME_HAS_NO_OWNER);
-        assert_eq!(t.try_call(call(14, BUS, "org.freedesktop.DBus.Peer", "Ping", &[])), "pass");
+        assert_eq!(t.try_call(bus(13, "GetConnectionUnixProcessID", &[":1.1"])), SERVICE_UNKNOWN);
+        assert_eq!(t.try_call(call(14, BUS, "org.freedesktop.DBus.Peer", "Ping", &[])), ACCESS_DENIED);
+        assert_eq!(t.try_call(call(15, BUS, "org.freedesktop.DBus.Properties", "Get", &[BUS, "Features"])), ACCESS_DENIED);
+        assert_eq!(t.try_call(bus(16, "RequestName", &["org.example.Hidden"])), SERVICE_UNKNOWN);
+        assert_eq!(t.try_call(call(17, BUS, "org.freedesktop.DBus.Introspectable", "Introspect", &[])), "pass");
     }
 
     #[test]
