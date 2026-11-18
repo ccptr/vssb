@@ -51,3 +51,13 @@ deliberate and this proxy is the stricter, an entry in `known` and the
 README. Tests use only their private `dbus-daemon`, never the
 session bus; try the session bus by hand only read-only (the example
 proxy with `--see`, then `ListNames` or a property read).
+
+`stopping_closes_connections` is flaky: on 2026-11-18 it failed once at
+"still accepting" in a full `cargo test`, then passed 40 times alone
+and 20 times with all of `tests/proxy.rs`. The likely cause, not
+confirmed: the proxy has closed its listener by the time `Proxy` drops
+(the accept thread owns it and is joined), but a child that another
+test in the same binary is starting (`dbus-daemon`, `dbus-test-tool`,
+`python3`) holds a copy of the listening socket between fork and exec,
+so the connect still succeeds. If it fails again, rerun it alone before
+suspecting the proxy's shutdown.

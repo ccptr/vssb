@@ -290,6 +290,8 @@ fn stopping_closes_connections() {
     stuck.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     assert_eq!(stuck.read(&mut buf).unwrap_or(0), 0);
     assert_eq!(logged.read(&mut buf).unwrap_or(0), 0);
+    // Flaky, rarely: a child another test is starting can hold the
+    // listening socket between fork and exec (dbus-proxy/AGENTS.md).
     assert!(UnixStream::connect(&path).is_err(), "still accepting");
 }
 
