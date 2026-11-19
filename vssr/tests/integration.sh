@@ -97,6 +97,17 @@ python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["ok"] == (
     && ok "check --json reports support and the plan" || bad "check --json reports support and the plan" "$(head -c 300 "$WORK/check.json")"
 expect "--json needs --dry-run"                  125 -- run --json -- true
 ( cd ~ && "$V" run -- true >/dev/null 2>&1 ); [ $? = 125 ] && ok "refuses to run from \$HOME with the default policy" || bad "refuses to run from \$HOME with the default policy"
+# Without $HOME (unset or empty), the home directory comes from passwd.
+PW_HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
+out=$(env -u HOME "$V" run -- sh -c 'echo "$HOME"' 2>&1)
+[ "$out" = "$PW_HOME" ] && ok "with \$HOME unset, the program gets passwd's home" || bad "with \$HOME unset, the program gets passwd's home" "$out"
+out=$(HOME= "$V" run -e HOME -- sh -c 'echo "$HOME"' 2>&1)
+[ "$out" = "$PW_HOME" ] && ok "  ...and with \$HOME empty, even passed on" || bad "  ...and with \$HOME empty, even passed on" "$out"
+( cd "$PW_HOME" && env -u HOME "$V" run -- true >/dev/null 2>&1 ); [ $? = 125 ] && ok "  ...and the default policy still refuses to run from it" || bad "  ...and the default policy still refuses to run from it"
+( cd "$PW_HOME" && HOME= "$V" run -- true >/dev/null 2>&1 ); [ $? = 125 ] && ok "  ...also with \$HOME empty" || bad "  ...also with \$HOME empty"
+mkdir -p "$WORK/fakehome"
+( cd "$WORK/fakehome" && HOME="$WORK/fakehome" "$V" run --no-home-check -- sh -c 'touch "$HOME/w"' >/dev/null 2>&1 ) && [ -e "$WORK/fakehome/w" ] \
+    && ok "--no-home-check runs from \$HOME, which is writable" || bad "--no-home-check runs from \$HOME, which is writable"
 expect_out "own PID namespace"         '^2$' -- run -- sh -c 'echo $$'
 expect_out "own hostname"              '^vssr$' -- run -- cat /proc/sys/kernel/hostname
 expect_out "runs as the host uid"      "^$(id -u)\$" -- run -- id -u

@@ -292,11 +292,11 @@ pub fn project_root(cwd: &Path, home: &Path) -> Option<PathBuf> {
 impl DetectCfg {
     /// The `within` (false) and `within_rw` (true) roots, canonical;
     /// missing directories are left out.
-    fn roots(&self, cwd: &Path) -> Result<Vec<(PathBuf, bool)>> {
+    fn roots(&self, cwd: &Path, home: &Path) -> Result<Vec<(PathBuf, bool)>> {
         let mut out = Vec::new();
         for (list, rw) in [(&self.within, false), (&self.within_rw, true)] {
             for w in list {
-                if let Ok(c) = std::fs::canonicalize(expand_path(w, cwd)?) {
+                if let Ok(c) = std::fs::canonicalize(expand_path(w, cwd, home)?) {
                     out.push((c, rw));
                 }
             }
@@ -646,8 +646,9 @@ pub struct FsOverrides {
 }
 
 impl Plan {
-    pub fn build(policy: &Policy, extra_fs: &FsOverrides, cwd: &Path) -> Result<Plan> {
-        let home = PathBuf::from(std::env::var("HOME").context("$HOME is not set")?);
+    /// `home` is the user's home directory ([`crate::util::home_dir`]): what
+    /// `~` and `$HOME` mean, and where project detection stops.
+    pub fn build(policy: &Policy, extra_fs: &FsOverrides, cwd: &Path, home: &Path) -> Result<Plan> {
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
 
@@ -676,8 +677,8 @@ impl Plan {
         // been tampered with by an earlier sandbox run, so no symlinks are
         // followed there. Directories under detect.within_rw may have been
         // written by an earlier run, whether or not this one exposes them.
-        let mut writable: Vec<PathBuf> = policy.detect.roots(cwd)?.into_iter().filter(|r| r.1).map(|r| r.0).collect();
-        let project = project_root(cwd, &std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone()));
+        let mut writable: Vec<PathBuf> = policy.detect.roots(cwd, home)?.into_iter().filter(|r| r.1).map(|r| r.0).collect();
+        let project = project_root(cwd, &std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
         if policy.detect.project == ProjectMode::Rw
             && let Some(p) = &project
             && let Ok(c) = std::fs::canonicalize(p)
@@ -686,7 +687,7 @@ impl Plan {
         }
         for (kind, spec) in &entries {
             if *kind == FsKind::Rw {
-                let (_, src, _) = split_spec(spec, cwd)?;
+                let (_, src, _) = split_spec(spec, cwd, home)?;
                 if let Ok(c) = std::fs::canonicalize(&src) {
                     writable.push(c);
                 }
@@ -695,7 +696,7 @@ impl Plan {
 
         let tmpfs_size = fs.tmpfs_size.as_deref().map(parse_size).transpose()?;
         for (kind, spec) in &entries {
-            let (optional, src, dest) = split_spec(spec, cwd)?;
+            let (optional, src, dest) = split_spec(spec, cwd, home)?;
             let m = match kind {
                 FsKind::Tmpfs => Mount { dest, kind: MountKind::Tmpfs { size: None }, noexec: false, optional, no_symlinks: false },
                 FsKind::Deny => {
@@ -734,10 +735,10 @@ impl Plan {
             mounts.insert(m.dest.clone(), m);
         }
 
-        let (detected, notes) = add_detected(&policy.detect, cwd, project.as_deref(), &mut mounts)?;
+        let (detected, notes) = add_detected(&policy.detect, cwd, home, project.as_deref(), &mut mounts)?;
 
         for spec in &fs.noexec {
-            let p = expand_path(spec, cwd)?;
+            let p = expand_path(spec, cwd, home)?;
             match mounts.get_mut(&p) {
                 Some(m) if matches!(m.kind, MountKind::Bind { .. } | MountKind::Tmpfs { .. }) => m.noexec = true,
                 _ => bail!("noexec {}: must name a ro, rw or tmpfs entry exactly", p.display()),
@@ -783,7 +784,7 @@ impl Plan {
         });
 
         let cwd_inside = match &policy.sandbox.cwd {
-            Some(c) => expand_path(c, cwd)?,
+            Some(c) => expand_path(c, cwd, home)?,
             None => cwd.to_path_buf(),
         };
         // The deepest mount containing the cwd decides (mounts are sorted parent-first).
@@ -804,7 +805,7 @@ impl Plan {
             bail!("net.allow only applies to net.mode = \"proxy\" (it is {:?})", policy.net.mode);
         }
 
-        let mut env = build_env(policy, &home, cwd)?;
+        let mut env = build_env(policy, home, cwd)?;
         if let Some(w) = &wayland {
             env.retain(|(k, _)| k != "WAYLAND_DISPLAY" && k != "XDG_RUNTIME_DIR");
             env.push(("WAYLAND_DISPLAY".into(), "wayland-0".into()));
@@ -875,7 +876,7 @@ impl Plan {
             seccomp_allow: policy.seccomp.allow.clone(),
             seccomp_deny: policy.seccomp.deny.clone(),
             // A host path, so '..' is fine here.
-            audit_log: policy.audit.log.as_deref().map(|l| expand(l, cwd).map(|e| cwd.join(e))).transpose()?,
+            audit_log: policy.audit.log.as_deref().map(|l| expand(l, cwd, home).map(|e| cwd.join(e))).transpose()?,
             quiet: policy.audit.quiet,
             writable,
             detected,
@@ -1128,12 +1129,13 @@ impl Plan {
 fn add_detected(
     cfg: &DetectCfg,
     cwd: &Path,
+    home: &Path,
     project: Option<&Path>,
     mounts: &mut BTreeMap<PathBuf, Mount>,
 ) -> Result<(BTreeMap<PathBuf, String>, Vec<String>)> {
     let det = crate::detect::run(&cfg.enable, cwd)?;
     let mut notes = det.notes;
-    let roots = cfg.roots(cwd)?;
+    let roots = cfg.roots(cwd, home)?;
     let mut found = det.found;
     // Parents first, so a dependency inside an added workspace is already covered.
     found.sort_by_key(|f| f.path.components().count());
@@ -1197,15 +1199,15 @@ fn add_detected(
 }
 
 /// Splits "SRC" or "SRC:DEST" (with an optional leading '?') into its parts.
-fn split_spec(spec: &str, cwd: &Path) -> Result<(bool, PathBuf, PathBuf)> {
+fn split_spec(spec: &str, cwd: &Path, home: &Path) -> Result<(bool, PathBuf, PathBuf)> {
     let (optional, spec) = match spec.strip_prefix('?') {
         Some(s) => (true, s),
         None => (false, spec),
     };
     let (src, dest) = match spec.split_once(':') {
-        Some((s, d)) => (expand_path(s, cwd)?, expand_path(d, cwd)?),
+        Some((s, d)) => (expand_path(s, cwd, home)?, expand_path(d, cwd, home)?),
         None => {
-            let p = expand_path(spec, cwd)?;
+            let p = expand_path(spec, cwd, home)?;
             (p.clone(), p)
         }
     };
@@ -1252,12 +1254,13 @@ fn build_env(policy: &Policy, home: &Path, cwd: &Path) -> Result<Vec<(String, St
             Some(prefix) => k.starts_with(prefix),
             None => *p == k,
         });
-        if pass {
+        // An empty $HOME passed on would hide the home directory set below.
+        if pass && !(k == "HOME" && v.is_empty()) {
             env.insert(k, v);
         }
     }
     for (k, v) in &policy.env.set {
-        env.insert(k.clone(), expand(v, cwd)?);
+        env.insert(k.clone(), expand(v, cwd, home)?);
     }
     env.entry("HOME".into()).or_insert_with(|| home.to_string_lossy().into_owned());
     env.entry("PATH".into()).or_insert_with(|| "/usr/local/bin:/usr/bin:/bin".into());
@@ -1293,12 +1296,28 @@ pub fn shell_words(argv: &[String]) -> String {
 mod tests {
     use super::*;
 
+    /// The home directory the plans in these tests are built for; it needn't exist.
+    const HOME: &str = "/home/vssr-test";
+
     #[test]
     fn default_policy_parses() {
         let p = Policy::default_policy();
         assert!(p.fs.system);
         assert_eq!(p.net.mode, NetMode::None);
         assert_eq!(p.fs.rw, vec!["$PWD"]);
+    }
+
+    #[test]
+    fn home_is_the_one_given() {
+        // `~` in the default policy's tmpfs, and $HOME in an entry: the home
+        // passed in, whatever $HOME says (vssr may have found it in passwd).
+        let cwd = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let mut o = FsOverrides::default();
+        o.entries.push((FsKind::Tmpfs, "$HOME/sub".into()));
+        let plan = Plan::build(&Policy::default_policy(), &o, &cwd, Path::new(HOME)).unwrap();
+        for d in [HOME, "/home/vssr-test/sub"] {
+            assert!(plan.mounts.iter().any(|m| m.dest == Path::new(d) && matches!(m.kind, MountKind::Tmpfs { .. })), "{d}");
+        }
     }
 
     #[test]
@@ -1316,7 +1335,7 @@ mod tests {
         let mut o = FsOverrides::default();
         o.entries.push((FsKind::Rw, "$PWD".into()));
         o.entries.push((FsKind::Tmpfs, "$PWD/vssr-test-sub".into()));
-        let plan = Plan::build(&p, &o, &cwd).unwrap();
+        let plan = Plan::build(&p, &o, &cwd, Path::new(HOME)).unwrap();
         assert_eq!(plan.mounts.len(), 2);
         assert!(matches!(plan.mounts[0].kind, MountKind::Bind { writable: true, .. }));
         assert!(matches!(plan.mounts[1].kind, MountKind::Tmpfs { .. }));
@@ -1341,7 +1360,7 @@ mod tests {
     fn tmpfs_size_reaches_every_tmpfs_and_shm() {
         let mut p = Policy::default();
         p.fs.tmpfs_size = Some("64M".into());
-        let plan = Plan::build(&p, &FsOverrides::default(), Path::new("/usr")).unwrap();
+        let plan = Plan::build(&p, &FsOverrides::default(), Path::new("/usr"), Path::new(HOME)).unwrap();
         let sizes: Vec<_> = plan
             .mounts
             .iter()
@@ -1373,7 +1392,7 @@ mod tests {
         for (k, e) in entries {
             o.entries.push((*k, e.replace("@", &base.to_string_lossy())));
         }
-        Plan::build(&p, &o, &base.join(cwd))
+        Plan::build(&p, &o, &base.join(cwd), Path::new(HOME))
     }
 
     #[test]
@@ -1409,7 +1428,7 @@ mod tests {
         assert_eq!(binds.len(), 2);
         assert!(binds.iter().all(|m| m.no_symlinks));
         // The system view too.
-        let plan = Plan::build(&Policy::default(), &FsOverrides::default(), Path::new("/usr")).unwrap();
+        let plan = Plan::build(&Policy::default(), &FsOverrides::default(), Path::new("/usr"), Path::new(HOME)).unwrap();
         assert!(plan.sandbox().resolved_mounts().unwrap().iter().all(|m| m.no_symlinks == matches!(m.kind, MountKind::Bind { .. } | MountKind::Socket { .. })));
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -1526,14 +1545,14 @@ mod tests {
         let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let mut p = Policy::default_policy();
         p.dbus.talk = vec!["org.example.App".into()];
-        let plan = Plan::build(&p, &FsOverrides::default(), &dir).unwrap();
+        let plan = Plan::build(&p, &FsOverrides::default(), &dir, Path::new(HOME)).unwrap();
         assert!(plan.dbus.is_none());
         assert!(plan.warnings.iter().any(|w| w.contains("dbus.session = true")), "{:?}", plan.warnings);
         // The proxy logs in for the program, so its uid inside doesn't matter.
         p.dbus.session = true;
         let uid = unsafe { libc::getuid() } + 1;
         p.sandbox.uid = Some(uid);
-        let plan = Plan::build(&p, &FsOverrides::default(), &dir).unwrap();
+        let plan = Plan::build(&p, &FsOverrides::default(), &dir, Path::new(HOME)).unwrap();
         assert_eq!(plan.dbus.unwrap().socket(), PathBuf::from(format!("/run/user/{uid}/bus")));
     }
 
@@ -1542,6 +1561,6 @@ mod tests {
         let mut p = Policy::default();
         p.fs.system = false;
         p.fs.tmpfs = vec!["/tmp".into()];
-        assert!(Plan::build(&p, &FsOverrides::default(), Path::new("/usr")).is_err());
+        assert!(Plan::build(&p, &FsOverrides::default(), Path::new("/usr"), Path::new(HOME)).is_err());
     }
 }

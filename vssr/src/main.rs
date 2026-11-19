@@ -169,6 +169,10 @@ struct RunArgs {
     /// Don't read the project's build files for extra rules
     #[arg(long)]
     no_detect: bool,
+    /// With the default policy, run even when the current directory contains
+    /// your home directory (which then becomes writable)
+    #[arg(long)]
+    no_home_check: bool,
     /// Print the resolved plan and exit
     #[arg(long)]
     dry_run: bool,
@@ -205,14 +209,14 @@ fn main() {
 fn resolve(args: &RunArgs) -> Result<Plan> {
     let cwd = std::env::current_dir().context("current directory")?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let home = util::home_dir()?;
     let mut p = match &args.policy {
         Some(path) => Policy::load(path)?,
         None => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            if cwd == Path::new("/") || Path::new(&home).starts_with(&cwd) {
+            if !args.no_home_check && (cwd == Path::new("/") || home.starts_with(&cwd)) {
                 bail!(
                     "the default policy makes the current directory writable, and {} contains your home directory; \
-                     run from a project directory or pass --policy",
+                     run from a project directory, pass --policy, or pass --no-home-check to allow it",
                     cwd.display()
                 );
             }
@@ -302,7 +306,7 @@ fn resolve(args: &RunArgs) -> Result<Plan> {
     if !args.command.is_empty() {
         p.command = args.command.clone();
     }
-    let mut plan = Plan::build(&p, &fs, &cwd)?;
+    let mut plan = Plan::build(&p, &fs, &cwd, &home)?;
     plan.cgroup = args.cgroup.as_ref().map(|c| cwd.join(c));
     Ok(plan)
 }

@@ -53,12 +53,31 @@ pub fn parse_size(s: &str) -> Result<u64> {
     Ok(bytes as u64)
 }
 
+/// The user's home directory: `$HOME` when it is set and not empty, else
+/// the one the user database (passwd, through NSS) gives for our uid. It
+/// must be absolute: the default-policy check and project detection judge
+/// paths against it.
+pub fn home_dir() -> Result<PathBuf> {
+    match std::env::home_dir() {
+        Some(h) if h.is_absolute() => Ok(h),
+        Some(h) => bail!("the home directory {} is not an absolute path (check $HOME)", h.display()),
+        None => bail!(
+            "can't find your home directory: $HOME is not set and the user database has no entry for uid {}",
+            unsafe { libc::getuid() }
+        ),
+    }
+}
+
 /// Expands a leading `~` and `$VAR` / `${VAR}` references. `$PWD` is the
-/// directory vssr was started in, whatever the environment says.
-pub fn expand(s: &str, cwd: &Path) -> Result<String> {
+/// directory vssr was started in and `~` and `$HOME` are `home` (see
+/// [`home_dir`]), whatever the environment says.
+pub fn expand(s: &str, cwd: &Path, home: &Path) -> Result<String> {
     let lookup = |name: &str| -> Result<String> {
         if name == "PWD" {
             return Ok(cwd.to_string_lossy().into_owned());
+        }
+        if name == "HOME" {
+            return Ok(home.to_string_lossy().into_owned());
         }
         std::env::var(name).map_err(|_| anyhow!("{s:?}: environment variable ${name} is not set"))
     };
@@ -94,8 +113,8 @@ pub fn expand(s: &str, cwd: &Path) -> Result<String> {
 /// and `.` and `..` are resolved lexically. The result is what vssr opens
 /// (without following symlinks, or after canonicalising it), so it never
 /// differs from what was checked.
-pub fn expand_path(s: &str, cwd: &Path) -> Result<PathBuf> {
-    let e = expand(s, cwd)?;
+pub fn expand_path(s: &str, cwd: &Path, home: &Path) -> Result<PathBuf> {
+    let e = expand(s, cwd, home)?;
     let p = Path::new(&e);
     let p = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
     normalize(&p)
@@ -318,14 +337,18 @@ mod tests {
 
     #[test]
     fn expansion() {
-        let cwd = Path::new("/work/dir");
+        let (cwd, home) = (Path::new("/work/dir"), Path::new("/users/me"));
         unsafe { std::env::set_var("VSSR_T", "x") };
-        assert_eq!(expand("$PWD/a", cwd).unwrap(), "/work/dir/a");
-        assert_eq!(expand("/a/${VSSR_T}/b$VSSR_T", cwd).unwrap(), "/a/x/bx");
-        assert!(expand("$VSSR_UNSET_VAR", cwd).is_err());
-        assert_eq!(expand_path("rel/./p", cwd).unwrap(), PathBuf::from("/work/dir/rel/p"));
-        assert_eq!(expand_path("../x/../y", cwd).unwrap(), PathBuf::from("/work/y"));
-        assert_eq!(expand_path("/../..", cwd).unwrap(), PathBuf::from("/"));
+        assert_eq!(expand("$PWD/a", cwd, home).unwrap(), "/work/dir/a");
+        assert_eq!(expand("/a/${VSSR_T}/b$VSSR_T", cwd, home).unwrap(), "/a/x/bx");
+        assert!(expand("$VSSR_UNSET_VAR", cwd, home).is_err());
+        // The given home, whatever $HOME says (it may be unset or empty).
+        assert_eq!(expand("~/a:$HOME/b:${HOME}", cwd, home).unwrap(), "/users/me/a:/users/me/b:/users/me");
+        assert_eq!(expand("~", cwd, home).unwrap(), "/users/me");
+        assert_eq!(expand("a~/b", cwd, home).unwrap(), "a~/b");
+        assert_eq!(expand_path("rel/./p", cwd, home).unwrap(), PathBuf::from("/work/dir/rel/p"));
+        assert_eq!(expand_path("../x/../y", cwd, home).unwrap(), PathBuf::from("/work/y"));
+        assert_eq!(expand_path("/../..", cwd, home).unwrap(), PathBuf::from("/"));
     }
 
     #[test]

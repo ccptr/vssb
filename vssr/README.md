@@ -77,6 +77,7 @@ vssr run [OPTIONS] -- COMMAND [ARGS...]
       --detect-project off|ro|rw  detected dependencies in the same git repository (default ro)
       --no-detect        don't read the project's build files for extra rules
       --no-strict        run even if Landlock or limits can't be enforced
+      --no-home-check    with the default policy, run even from a directory containing $HOME
       --dry-run          print the resolved plan and exit (--json: for programs)
 vssr check [same options]  kernel support + resolved plan (--json: for programs)
 vssr policy                print the built-in default policy
@@ -168,7 +169,9 @@ quiet = false           # vssr's messages (notes, warnings, blocked requests) on
 ```
 
 **Paths.** `~`, `$VAR` and `${VAR}` are expanded; `$PWD` is the directory
-vssr started in. When two entries name the same path, `deny` beats `rw`
+vssr started in. `~` and `$HOME` are your home directory: `$HOME`, or when
+it is unset or empty, your passwd entry's (the program gets that as
+`$HOME` too). When two entries name the same path, `deny` beats `rw`
 beats `ro` beats `tmpfs`, and command-line entries beat the policy file.
 Nested entries work in any combination, e.g. a read-only `.git` inside a
 writable checkout, or a hidden `.env` inside it. A path that is a symlink
