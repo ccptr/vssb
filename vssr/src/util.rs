@@ -2,7 +2,7 @@
 //! timestamps.
 
 use anyhow::{Context, Result, anyhow, bail};
-use std::ffi::{CString, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
@@ -58,13 +58,47 @@ pub fn parse_size(s: &str) -> Result<u64> {
 /// must be absolute: the default-policy check and project detection judge
 /// paths against it.
 pub fn home_dir() -> Result<PathBuf> {
-    match std::env::home_dir() {
-        Some(h) if h.is_absolute() => Ok(h),
-        Some(h) => bail!("the home directory {} is not an absolute path (check $HOME)", h.display()),
-        None => bail!(
-            "can't find your home directory: $HOME is not set and the user database has no entry for uid {}",
-            unsafe { libc::getuid() }
-        ),
+    let (home, from) = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        Some(h) => (PathBuf::from(h), "$HOME"),
+        None => (passwd_home()?, "your passwd entry (as $HOME is not set)"),
+    };
+    if !home.is_absolute() {
+        bail!("the home directory from {from}, {}, is not an absolute path", home.display());
+    }
+    Ok(home)
+}
+
+/// Our uid's home directory in the user database. `std::env::home_dir`'s
+/// fallback, except that it grows the buffer when the entry doesn't fit and
+/// reports errors rather than treating them as no entry.
+fn passwd_home() -> Result<PathBuf> {
+    let len = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n <= 0 => 512,
+        n => n as usize,
+    };
+    passwd_home_from(len)
+}
+
+/// [`passwd_home`], starting with a buffer of `len` bytes.
+fn passwd_home_from(mut len: usize) -> Result<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    loop {
+        let mut buf = vec![0 as libc::c_char; len];
+        let mut pw = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found = std::ptr::null_mut();
+        match unsafe { libc::getpwuid_r(uid, pw.as_mut_ptr(), buf.as_mut_ptr(), buf.len(), &mut found) } {
+            // pw_dir points into buf, which is still alive here.
+            0 if !found.is_null() && !unsafe { (*found).pw_dir }.is_null() => {
+                let dir = unsafe { CStr::from_ptr((*found).pw_dir) };
+                return Ok(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+            }
+            0 => bail!("can't find your home directory: $HOME is not set and the user database has no entry for uid {uid}"),
+            libc::ERANGE if len < 1 << 20 => len *= 2,
+            e => {
+                return Err(std::io::Error::from_raw_os_error(e))
+                    .with_context(|| format!("$HOME is not set, and looking up uid {uid} in the user database failed"));
+            }
+        }
     }
 }
 
@@ -333,6 +367,14 @@ mod tests {
             assert!(e.contains("refusing to follow the symlink"), "{p}: {e}");
         }
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn passwd_home_is_absolute() {
+        let h = passwd_home().unwrap();
+        assert!(h.is_absolute(), "{}", h.display());
+        // An entry that doesn't fit the first buffer: it grows.
+        assert_eq!(passwd_home_from(1).unwrap(), h);
     }
 
     #[test]
