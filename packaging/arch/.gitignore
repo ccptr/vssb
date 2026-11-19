@@ -1,0 +1,7 @@
+# makepkg run in place: clones, build trees and packages.
+*/vssb/
+*/ossteam/
+*/src/
+*/pkg/
+*.pkg.tar.*
+*.log

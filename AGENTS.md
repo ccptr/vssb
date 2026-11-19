@@ -7,6 +7,10 @@ A Cargo workspace (virtual manifest at the root, one `Cargo.lock` and
 - `dbus-proxy/`: the filtering D-Bus proxy library. Read `dbus-proxy/AGENTS.md`.
 - `vssr/`: the command-line front end built on both (policy files,
   detection, audit log). Read `vssr/AGENTS.md`.
+- `packaging/arch/`: PKGBUILDs for vssr. `vssr-git` follows `main`;
+  `vssr` is pinned to a vssb and an ossteam commit (no release is tagged
+  yet). To move it, set `_commit`, `_ossteam_commit` and `pkgver`, then
+  run `updpkgsums`; the vssb commit must be on GitHub.
 
 Read the AGENTS.md of each crate you work in. Run `cargo test` from the
 root to test every crate.

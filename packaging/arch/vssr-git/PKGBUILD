@@ -1,0 +1,57 @@
+# Maintainer: ccptr
+
+pkgname=vssr-git
+pkgver=0.1.0.r37.g6f485e6
+pkgrel=1
+pkgdesc='Rootless Linux sandbox for running agents unattended: namespaces, Landlock, seccomp, filtered network and D-Bus'
+arch=('x86_64' 'aarch64')
+url='https://github.com/ccptr/vssb'
+# vssr and vssb are MPL-2.0; ossteam-dbus, linked in statically, LGPL-2.1-or-later.
+license=('MPL-2.0' 'LGPL-2.1-or-later')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+provides=('vssr')
+conflicts=('vssr')
+# vssb's Cargo.toml takes ossteam-dbus from ../ossteam, next to the checkout.
+source=('vssb::git+https://github.com/ccptr/vssb.git'
+        'ossteam::git+https://github.com/ccptr/OSSteam.git')
+sha256sums=('SKIP'
+            'SKIP')
+
+pkgver() {
+  cd vssb
+  local ver
+  ver=$(sed -n 's/^version = "\(.*\)"/\1/p' vssr/Cargo.toml | head -n1)
+  printf '%s.r%s.g%s' "$ver" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd vssb
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+  cd vssb
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p vssr
+}
+
+check() {
+  cd vssb
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Only vssr's unit tests: vssb's and the end-to-end ones need user
+  # namespaces, which a clean chroot may not allow. One unit test reads the
+  # session bus's address from the environment (it connects to nothing).
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+    cargo test --frozen --release -p vssr
+}
+
+package() {
+  cd vssb
+  install -Dm755 target/release/vssr -t "$pkgdir/usr/bin"
+  install -Dm644 vssr/README.md -t "$pkgdir/usr/share/doc/vssr"
+  install -Dm644 vssr/examples/*.toml -t "$pkgdir/usr/share/doc/vssr/examples"
+}
