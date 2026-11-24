@@ -1,7 +1,7 @@
 //! vssr: a Linux sandbox for running agents unattended, with fine-grained
 //! filesystem, network, syscall and resource permissions. Needs no root.
 //! The sandbox itself (namespaces, Landlock, seccomp, cgroup scope) is
-//! vssb's; vssr adds policy files, detection, the proxy's rules, signal
+//! vssl's; vssr adds policy files, detection, the proxy's rules, signal
 //! forwarding, the timeout and the audit log.
 
 mod audit;
@@ -19,10 +19,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use vssb::proxy::{self, Event};
-use vssb::{Enforcement, Via};
+use vssl::proxy::{self, Event};
+use vssl::{Enforcement, Via};
 
-/// vssr's own failure to set up the sandbox (as vssb reports it too).
+/// vssr's own failure to set up the sandbox (as vssl reports it too).
 const EXIT_SETUP: i32 = 125;
 const EXIT_TIMEOUT: i32 = 124;
 
@@ -427,17 +427,17 @@ fn supervise(plan: &Plan, id: &str, audit: &Arc<Audit>, fds: Vec<(i32, OwnedFd)>
     }
     let mut sb = plan.sandbox();
     if let (Some(w), Some(ctx)) = (&plan.wayland, &wayland) {
-        sb.mount(vssb::Mount::socket_at(ctx.socket(), w.socket()).no_symlinks());
+        sb.mount(vssl::Mount::socket_at(ctx.socket(), w.socket()).no_symlinks());
     }
     if let (Some(d), Some(proxy)) = (&plan.dbus, &dbus) {
-        sb.mount(vssb::Mount::socket_at(&proxy.socket, d.socket()).no_symlinks());
+        sb.mount(vssl::Mount::socket_at(&proxy.socket, d.socket()).no_symlinks());
     }
     let mut child = match sb.spawn(cmd) {
         Ok(c) => c,
         Err(e) => {
             let code = e.shell_code();
             audit.say("setup_failed", json!({"command": plan.argv, "code": code, "error": e.to_string()}), &e.to_string());
-            if matches!(e, vssb::Error::Unsupported(_)) && !audit.quiet {
+            if matches!(e, vssl::Error::Unsupported(_)) && !audit.quiet {
                 eprintln!("vssr: `vssr check` shows what this system supports; --no-strict runs with what is available");
             }
             return Ok(code);
@@ -607,9 +607,9 @@ impl Drop for RunDir {
 /// Creates the security-context listener and refuses to go on if escape
 /// protocols are visible through it (unless the policy accepts that).
 /// Dropping the context stops the listener and removes its socket.
-fn start_wayland(w: &policy::WaylandPlan, dir: &RunDir, id: &str, audit: &Audit) -> Result<vssb::wayland::Context> {
-    let opts = vssb::wayland::Options { engine: "vssr".into(), app_id: w.app_id.clone(), instance_id: Some(id.into()) };
-    let ctx = vssb::wayland::Context::create(&w.compositor, &dir.path.join("wayland-0"), &opts)
+fn start_wayland(w: &policy::WaylandPlan, dir: &RunDir, id: &str, audit: &Audit) -> Result<vssl::wayland::Context> {
+    let opts = vssl::wayland::Options { engine: "vssr".into(), app_id: w.app_id.clone(), instance_id: Some(id.into()) };
+    let ctx = vssl::wayland::Context::create(&w.compositor, &dir.path.join("wayland-0"), &opts)
         .map_err(|e| anyhow::anyhow!("gui.wayland: {e}"))?;
     let escapes = ctx.escapes();
     audit.event(
@@ -695,7 +695,7 @@ fn dbus_event(audit: &Audit, shown: &std::sync::Mutex<std::collections::HashSet<
 }
 
 /// Passes pending signals on to the program (through the sandbox's PID 1).
-fn forward_signals(plan: &Plan, sfd: &OwnedFd, child: &vssb::Child, audit: &Audit) {
+fn forward_signals(plan: &Plan, sfd: &OwnedFd, child: &vssl::Child, audit: &Audit) {
     loop {
         let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::signalfd_siginfo>();

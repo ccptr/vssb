@@ -2,7 +2,7 @@
 //! whole process, so it is its own test binary with a single test.
 
 use std::io::Read;
-use vssb::{Cgroup, Command, Sandbox, Stdio};
+use vssl::{Cgroup, Command, Sandbox, Stdio};
 
 #[test]
 fn closed_stdio_gets_dev_null() {
@@ -22,7 +22,7 @@ fn closed_stdio_gets_dev_null() {
         unsafe { libc::close(fd) };
     }
     let r = sb.spawn(c);
-    // vssb keeps nothing of its own there.
+    // vssl keeps nothing of its own there.
     let held: Vec<i32> = (0..3).filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0).collect();
     for (fd, &s) in saved.iter().enumerate() {
         unsafe {
@@ -32,7 +32,7 @@ fn closed_stdio_gets_dev_null() {
     }
 
     let mut child = r.expect("spawn");
-    assert_eq!(held, [0i32; 0], "descriptors vssb left on 0-2");
+    assert_eq!(held, [0i32; 0], "descriptors vssl left on 0-2");
     let mut out = String::new();
     child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
     let fds: Vec<(&str, &str)> = out.lines().filter_map(|l| l.split_once(' ')).collect();

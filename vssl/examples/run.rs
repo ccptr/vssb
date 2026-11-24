@@ -1,4 +1,4 @@
-//! A tiny front-end, to try vssb by hand:
+//! A tiny front-end, to try vssl by hand:
 //!
 //!   cargo run --example run -- [--ro PATH] [--rw PATH] [--tmpfs PATH] [--deny PATH]
 //!       [--host-net] [--memory BYTES] [--pids N] [--cwd DIR] [--tty] -- COMMAND [ARGS...]
@@ -7,7 +7,7 @@
 //! working directory, and PATH, TERM, LANG and HOME are passed through.
 
 use std::path::PathBuf;
-use vssb::{Command, Limits, Mount, Net, Sandbox};
+use vssl::{Command, Limits, Mount, Net, Sandbox};
 
 fn main() {
     let mut args = std::env::args().skip(1);

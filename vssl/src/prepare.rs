@@ -62,7 +62,7 @@ pub(crate) struct Prepared {
     pub any_dev: bool,
     // The child's own bookkeeping, preallocated (one slot per mount).
     pub attached: Vec<bool>,
-    /// Per mount: 0 not a region, 1 a fresh filesystem vssb may create
+    /// Per mount: 0 not a region, 1 a fresh filesystem vssl may create
     /// mount points in, 2 a host directory (or /proc) it may not.
     pub regions: Vec<u8>,
     pub sources: Vec<i32>,
@@ -523,8 +523,8 @@ pub(crate) fn prepare(sb: &Sandbox, cmd: Command) -> Result<(Prepared, Parent)> 
             CgroupPlan::None
         }
         Cgroup::Auto if cg_limits.is_empty() => CgroupPlan::None,
-        Cgroup::Auto => CgroupPlan::Scope { unit: format!("vssb-{id}.scope"), required: false },
-        Cgroup::SystemdUserScope => CgroupPlan::Scope { unit: format!("vssb-{id}.scope"), required: true },
+        Cgroup::Auto => CgroupPlan::Scope { unit: format!("vssl-{id}.scope"), required: false },
+        Cgroup::SystemdUserScope => CgroupPlan::Scope { unit: format!("vssl-{id}.scope"), required: true },
         Cgroup::Join(path) => {
             let f = File::options()
                 .read(true)
@@ -626,7 +626,7 @@ mod tests {
         sb.mount(Mount::tmpfs(tmp.join("sub")))
             .mount(Mount::ro(&tmp))
             .mount(Mount::rw(&tmp))
-            .mount(Mount::ro("/vssb-surely-missing").optional());
+            .mount(Mount::ro("/vssl-surely-missing").optional());
         let m = sb.resolved_mounts().unwrap();
         assert_eq!(m.len(), 2);
         assert!(matches!(m[0].kind, MountKind::Bind { writable: true, .. }));
@@ -642,7 +642,7 @@ mod tests {
         sb.mount(Mount::tmpfs("/"));
         assert!(sb.resolved_mounts().is_err());
         let mut sb = Sandbox::new();
-        sb.mount(Mount::ro("/vssb-surely-missing"));
+        sb.mount(Mount::ro("/vssl-surely-missing"));
         assert!(sb.resolved_mounts().is_err());
         let mut sb = Sandbox::new();
         sb.mount(Mount::tmpfs("/tmp"));

@@ -40,7 +40,7 @@ const SCOPE_SIGNAL: u64 = 1 << 1;
 const RULE_PATH_BENEATH: u32 = 1;
 const RULE_NET_PORT: u32 = 2;
 
-/// The newest ABI whose rights vssb knows.
+/// The newest ABI whose rights vssl knows.
 const TARGET: u32 = 9;
 
 pub(crate) const READ: u64 = EXECUTE | READ_FILE | READ_DIR;

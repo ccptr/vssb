@@ -6,12 +6,12 @@
 //! requests, decides by host name and port, refuses private addresses, and
 //! connects to the address it checked (no DNS rebinding).
 //!
-//! The proxy is the only part of vssb that starts threads: one to accept,
+//! The proxy is the only part of vssl that starts threads: one to accept,
 //! and two per connection. [`ProxyHandle`] stops them all.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use vssb::{proxy, Command, Sandbox};
+//! use vssl::{proxy, Command, Sandbox};
 //! let mut sb = Sandbox::new();
 //! sb.system(true).listen_tcp(3128);
 //! let mut cmd = Command::new("curl");
@@ -284,7 +284,7 @@ pub fn serve(listener: TcpListener, policy: NetPolicy, events: impl Fn(&Event) +
     let shared = Arc::new(Shared { policy, events: Arc::new(events), stop: AtomicBool::new(false), next: AtomicU64::new(0), conns: Mutex::new(HashMap::new()) });
     let l = listener.try_clone()?;
     let sh = shared.clone();
-    let thread = std::thread::Builder::new().name("vssb-proxy".into()).spawn(move || accept_loop(l, sh))?;
+    let thread = std::thread::Builder::new().name("vssl-proxy".into()).spawn(move || accept_loop(l, sh))?;
     Ok(ProxyHandle { shared, listener, thread: Some(thread) })
 }
 
@@ -328,10 +328,10 @@ struct Request {
 }
 
 fn respond(c: &mut TcpStream, status: &str, msg: &str) {
-    let body = format!("vssb: {msg}\n");
+    let body = format!("vssl: {msg}\n");
     let _ = write!(
         c,
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\nX-Vssb-Proxy: blocked\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\nX-Vssl-Proxy: blocked\r\n\r\n{body}",
         body.len()
     );
 }

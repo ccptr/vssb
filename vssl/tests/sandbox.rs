@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use vssb::{Cgroup, Command, Error, ExitStatus, Limits, Mount, Net, Resource, Sandbox, Stdio};
+use vssl::{Cgroup, Command, Error, ExitStatus, Limits, Mount, Net, Resource, Sandbox, Stdio};
 
 /// A fresh host directory, removed on drop.
 struct Dir(PathBuf);
@@ -17,7 +17,7 @@ impl Dir {
     fn new() -> Dir {
         static N: AtomicUsize = AtomicUsize::new(0);
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let p = base.join(format!("vssb-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let p = base.join(format!("vssl-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&p).unwrap();
         Dir(p)
     }
@@ -116,7 +116,7 @@ fn exec_errors() {
     let e = sb.spawn(Command::new("/nonexistent/cmd")).unwrap_err();
     assert!(matches!(e, Error::Exec { .. }), "{e}");
     assert_eq!(e.shell_code(), 127);
-    let mut c = Command::new("no-such-program-vssb");
+    let mut c = Command::new("no-such-program-vssl");
     c.env("PATH", "/usr/bin:/bin");
     assert_eq!(sb.spawn(c).unwrap_err().shell_code(), 127);
     std::fs::write(d.0.join("noexec"), "#!/bin/sh\n").unwrap();
@@ -167,13 +167,13 @@ fn filesystem_view() {
     let sb = sandbox(&d);
     assert_eq!(code(&sb, &d, "echo hi > out.txt"), 0);
     assert_eq!(std::fs::read_to_string(d.0.join("out.txt")).unwrap(), "hi\n");
-    assert_eq!(code(&sb, &d, "touch /usr/vssb-x"), 1);
-    assert_eq!(code(&sb, &d, "touch /etc/vssb-x"), 1);
-    assert_eq!(code(&sb, &d, "touch /vssb-x"), 1, "the root is read-only");
+    assert_eq!(code(&sb, &d, "touch /usr/vssl-x"), 1);
+    assert_eq!(code(&sb, &d, "touch /etc/vssl-x"), 1);
+    assert_eq!(code(&sb, &d, "touch /vssl-x"), 1, "the root is read-only");
     let secret = Dir::new();
     std::fs::write(secret.0.join("s"), "x").unwrap();
     assert_ne!(code(&sb, &d, &format!("cat {}/s", secret.0.display())), 0, "unlisted host paths are invisible");
-    assert_eq!(code(&sb, &d, "test -z \"$(ls /tmp | grep -v vssb-test)\""), 0, "/tmp is private");
+    assert_eq!(code(&sb, &d, "test -z \"$(ls /tmp | grep -v vssl-test)\""), 0, "/tmp is private");
 }
 
 #[test]
@@ -362,7 +362,7 @@ fn bind_sources_swapped_for_symlinks_are_refused() {
         // refused whenever the child meets it, never followed.
         let r = race_bind(&src, true, raced);
         assert!(r.secret == 0 && r.other.is_empty() && raced(&r), "no_symlinks, {}: {r:?}", src.display());
-        // Resolved by vssb: following the symlink while resolving is how a
+        // Resolved by vssl: following the symlink while resolving is how a
         // plain source works, but one swapped in after that is refused.
         let r = race_bind(&src, false, |r| r.refused > 0 && r.real > 0);
         assert!(r.other.is_empty() && r.refused > 0 && r.real > 0, "resolved, {}: {r:?}", src.display());
@@ -418,7 +418,7 @@ print(swaps)
 fn missing_sources_are_config_errors() {
     let d = Dir::new();
     let mut sb = sandbox(&d);
-    sb.mount(Mount::ro("/vssb-surely-missing"));
+    sb.mount(Mount::ro("/vssl-surely-missing"));
     assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))));
 }
 
@@ -442,7 +442,7 @@ fn devices() {
 
 #[test]
 fn host_unix_sockets_are_unreachable() {
-    if vssb::probe().landlock_abi < 9 {
+    if vssl::probe().landlock_abi < 9 {
         return;
     }
     let d = Dir::new();
@@ -483,7 +483,7 @@ fn only_given_sockets_are_connectable() {
     assert_eq!(out.trim(), "got hi");
     // Inside the read-only directory it comes from: its neighbour stays
     // unreachable.
-    if vssb::probe().landlock_abi >= 9 {
+    if vssl::probe().landlock_abi >= 9 {
         let mut sb = sandbox(&d);
         sb.mount(Mount::ro(&sock_dir.0)).mount(Mount::socket(&given));
         let out = run(&sb, python(&d, &connect(&other))).1;
@@ -514,24 +514,24 @@ fn socket_entries_take_only_sockets() {
 }
 
 /// The compositor the Wayland tests use: a headless one, named by
-/// VSSB_TEST_WAYLAND (a socket path, or a name in $XDG_RUNTIME_DIR). Never
+/// VSSL_TEST_WAYLAND (a socket path, or a name in $XDG_RUNTIME_DIR). Never
 /// the live session's, so they are skipped without it.
 fn test_compositor() -> Option<PathBuf> {
-    let w = std::env::var("VSSB_TEST_WAYLAND").ok()?;
+    let w = std::env::var("VSSL_TEST_WAYLAND").ok()?;
     let p = Path::new(&w);
     Some(if p.is_absolute() { p.to_path_buf() } else { Path::new(&std::env::var("XDG_RUNTIME_DIR").ok()?).join(p) })
 }
 
 #[test]
 fn wayland_through_a_security_context() {
-    use vssb::wayland::{Context, Options};
+    use vssl::wayland::{Context, Options};
     let Some(compositor) = test_compositor() else {
-        eprintln!("skipped: set VSSB_TEST_WAYLAND to a headless compositor's socket");
+        eprintln!("skipped: set VSSL_TEST_WAYLAND to a headless compositor's socket");
         return;
     };
     let d = Dir::new();
     let host = Dir::new();
-    let opts = Options { engine: "vssb-test".into(), app_id: Some("org.example.Test".into()), instance_id: Some("t1".into()) };
+    let opts = Options { engine: "vssl-test".into(), app_id: Some("org.example.Test".into()), instance_id: Some("t1".into()) };
     let ctx = Context::create(&compositor, &host.0.join("wayland-0"), &opts).unwrap();
     assert!(ctx.globals().iter().any(|g| g == "wl_compositor"), "{:?}", ctx.globals());
     assert_eq!(ctx.escapes(), Vec::<&str>::new(), "this compositor leaks privileged globals");
@@ -543,7 +543,7 @@ fn wayland_through_a_security_context() {
     let (s, out) = run(&sb, c);
     assert!(s.success(), "{s}: {out}");
     assert!(out.contains("wl_compositor"), "{out}");
-    for e in vssb::wayland::ESCAPES {
+    for e in vssl::wayland::ESCAPES {
         assert!(!out.contains(&format!("'{e}'")), "{e} visible inside: {out}");
     }
     // Dropped: the compositor stops accepting, and the socket is gone.
@@ -766,7 +766,7 @@ fn spawning_while_other_threads_hold_libc_locks() {
 #[test]
 #[ignore]
 fn helper_spawn_and_hang() {
-    if std::env::var_os("VSSB_HELPER").is_none() {
+    if std::env::var_os("VSSL_HELPER").is_none() {
         return;
     }
     let d = Dir::new();
@@ -780,7 +780,7 @@ fn helper_spawn_and_hang() {
 fn sandbox_dies_with_its_host() {
     let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "helper_spawn_and_hang", "--ignored", "--nocapture", "--test-threads=1"])
-        .env("VSSB_HELPER", "1")
+        .env("VSSL_HELPER", "1")
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -837,7 +837,7 @@ fn listeners_reach_the_host() {
 
 #[test]
 fn tcp_ports_with_host_network() {
-    if vssb::probe().landlock_abi < 4 {
+    if vssl::probe().landlock_abi < 4 {
         return;
     }
     let (a, b) = (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
@@ -852,10 +852,10 @@ fn tcp_ports_with_host_network() {
 
 #[test]
 fn abstract_sockets_are_scoped() {
-    if vssb::probe().landlock_abi < 6 {
+    if vssl::probe().landlock_abi < 6 {
         return;
     }
-    let name = format!("\0vssb-test-{}", std::process::id());
+    let name = format!("\0vssl-test-{}", std::process::id());
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as u16;
@@ -879,7 +879,7 @@ fn abstract_sockets_are_scoped() {
 #[test]
 fn proxy_filters_requests() {
     use std::sync::{Arc, Mutex};
-    use vssb::proxy;
+    use vssl::proxy;
     // An HTTP server on the host's loopback.
     let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = server.local_addr().unwrap().port();
@@ -915,7 +915,7 @@ fn proxy_filters_requests() {
 // == resource limits
 
 fn limits_available() -> bool {
-    vssb::probe().systemd_user
+    vssl::probe().systemd_user
 }
 
 #[test]
@@ -952,11 +952,11 @@ fn limits_through_the_scope_are_in_effect() {
     let d = Dir::new();
     for cpus in [0.5, 1.2345549] {
         let mut sb = sandbox(&d);
-        let l = Limits { memory: Some((64 << 20) + 1), cpus: Some(cpus), cpu_method: vssb::CpuMethod::Cgroup, pids: Some(16), ..Default::default() };
+        let l = Limits { memory: Some((64 << 20) + 1), cpus: Some(cpus), cpu_method: vssl::CpuMethod::Cgroup, pids: Some(16), ..Default::default() };
         sb.strict(true).limits(l);
         let mut child = sb.spawn(sh(&d, "true")).expect("spawn");
         let e = child.enforcement().clone();
-        assert_eq!((e.memory, e.cpus, e.pids), (Some(vssb::Via::Cgroup), Some(vssb::Via::Cgroup), Some(vssb::Via::Cgroup)), "{cpus}");
+        assert_eq!((e.memory, e.cpus, e.pids), (Some(vssl::Via::Cgroup), Some(vssl::Via::Cgroup), Some(vssl::Via::Cgroup)), "{cpus}");
         child.wait().unwrap();
     }
 }
@@ -973,7 +973,7 @@ fn freeze_through_the_scope() {
     c.id(format!("test-freeze-{}", std::process::id()));
     let mut child = sb.spawn(c).unwrap();
     let cg = child.cgroup().unwrap().to_path_buf();
-    assert!(cg.ends_with(format!("vssb-test-freeze-{}.scope", std::process::id())), "{}", cg.display());
+    assert!(cg.ends_with(format!("vssl-test-freeze-{}.scope", std::process::id())), "{}", cg.display());
     child.freeze(true).unwrap();
     std::thread::sleep(Duration::from_millis(800));
     assert_eq!(child.try_wait().unwrap(), None, "frozen");
@@ -983,7 +983,7 @@ fn freeze_through_the_scope() {
 
 #[test]
 fn probe_reports_support() {
-    let s = vssb::probe();
+    let s = vssl::probe();
     assert!(s.ready(), "{s:?}");
     assert!(!Path::new(&s.kernel).as_os_str().is_empty());
 }
@@ -998,7 +998,7 @@ fn no_cgroup(dir: &Dir) -> Sandbox {
 }
 
 /// Spawns, or None when this kernel can't size a PID namespace.
-fn spawn_pid_limited(sb: &Sandbox, cmd: Command) -> Option<vssb::Child> {
+fn spawn_pid_limited(sb: &Sandbox, cmd: Command) -> Option<vssl::Child> {
     match sb.spawn(cmd) {
         Err(Error::Unsupported(m)) if m.contains("pid_max") => None,
         r => Some(r.expect("spawn")),
@@ -1018,7 +1018,7 @@ fn pids_without_a_cgroup_are_exact() {
         for _ in range(50):\n    p = os.fork()\n    if p == 0: os._exit(0)\n    os.waitpid(p, 0)\n\
         print(a, fill())";
     let Some(mut child) = spawn_pid_limited(&sb, python(&d, code)) else { return };
-    assert_eq!(child.enforcement().pids, Some(vssb::Via::PidNamespace));
+    assert_eq!(child.enforcement().pids, Some(vssl::Via::PidNamespace));
     let mut out = String::new();
     child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
     assert!(child.wait().unwrap().success());
@@ -1038,8 +1038,8 @@ fn limits_that_need_a_cgroup_are_config_errors_without_one() {
     let d = Dir::new();
     for l in [
         Limits { memory: Some(1 << 30), ..Default::default() },
-        Limits { cpus: Some(1.0), cpu_method: vssb::CpuMethod::Cgroup, ..Default::default() },
-        Limits { pids: Some(64), pids_method: vssb::PidsMethod::Cgroup, ..Default::default() },
+        Limits { cpus: Some(1.0), cpu_method: vssl::CpuMethod::Cgroup, ..Default::default() },
+        Limits { pids: Some(64), pids_method: vssl::PidsMethod::Cgroup, ..Default::default() },
     ] {
         let mut sb = no_cgroup(&d);
         sb.limits(l.clone());
@@ -1066,14 +1066,14 @@ fn joining_a_directory_that_is_not_a_cgroup_is_refused() {
 }
 
 /// A host thread that reaps every child (`waitpid(-1)`) can't take
-/// anything vssb needs: the scope still comes up. In a process of its own
+/// anything vssl needs: the scope still comes up. In a process of its own
 /// (the test re-runs itself), so the reaper can't take other tests'
 /// children.
 #[test]
 fn limits_survive_a_host_that_reaps_every_child() {
-    const INSIDE: &str = "VSSB_TEST_REAPING_HOST";
+    const INSIDE: &str = "VSSL_TEST_REAPING_HOST";
     if std::env::var_os(INSIDE).is_none() {
-        if !vssb::probe().systemd_user {
+        if !vssl::probe().systemd_user {
             eprintln!("skipped: no systemd user manager");
             return;
         }
@@ -1099,8 +1099,8 @@ fn limits_survive_a_host_that_reaps_every_child() {
     sb.limits(Limits { memory: Some(256 << 20), pids: Some(64), ..Default::default() });
     for _ in 0..5 {
         let mut child = sb.spawn(sh(&d, "true")).expect("spawn");
-        assert_eq!(child.enforcement().memory, Some(vssb::Via::Cgroup));
-        assert_eq!(child.enforcement().pids, Some(vssb::Via::Cgroup));
+        assert_eq!(child.enforcement().memory, Some(vssl::Via::Cgroup));
+        assert_eq!(child.enforcement().pids, Some(vssl::Via::Cgroup));
         assert!(child.wait().unwrap().success());
     }
     STOP.store(true, Ordering::Relaxed);
@@ -1111,7 +1111,7 @@ fn limits_survive_a_host_that_reaps_every_child() {
 /// sandbox starts in the given cgroup, and the limits are written to it.
 #[test]
 fn joins_a_given_cgroup() {
-    const INSIDE: &str = "VSSB_TEST_IN_DELEGATED_SCOPE";
+    const INSIDE: &str = "VSSL_TEST_IN_DELEGATED_SCOPE";
     if std::env::var_os(INSIDE).is_none() {
         let st = std::process::Command::new("systemd-run")
             .args(["--user", "--scope", "-q", "-p", "Delegate=yes", "--"])
@@ -1123,7 +1123,7 @@ fn joins_a_given_cgroup() {
         match st {
             Ok(s) if s.code() == Some(0) => {}
             // No user manager (systemd-run fails before running anything).
-            Ok(s) if !vssb::probe().systemd_user => eprintln!("skipped: no systemd user manager ({s})"),
+            Ok(s) if !vssl::probe().systemd_user => eprintln!("skipped: no systemd user manager ({s})"),
             r => panic!("inside the scope: {r:?}"),
         }
         return;
@@ -1142,8 +1142,8 @@ fn joins_a_given_cgroup() {
     let mut sb = sandbox(&d);
     sb.cgroup(Cgroup::Join(target.clone())).limits(Limits { memory: Some(64 << 20), pids: Some(32), ..Default::default() });
     let mut child = sb.spawn(sh(&d, "sleep 30")).expect("spawn");
-    assert_eq!(child.enforcement().memory, Some(vssb::Via::Cgroup));
-    assert_eq!(child.enforcement().pids, Some(vssb::Via::Cgroup));
+    assert_eq!(child.enforcement().memory, Some(vssl::Via::Cgroup));
+    assert_eq!(child.enforcement().pids, Some(vssl::Via::Cgroup));
     let procs = std::fs::read_to_string(target.join("cgroup.procs")).unwrap();
     assert!(procs.lines().any(|p| p == child.id().to_string()), "{procs}");
     assert_eq!(std::fs::read_to_string(target.join("memory.max")).unwrap().trim(), (64 << 20).to_string());
@@ -1153,7 +1153,7 @@ fn joins_a_given_cgroup() {
 }
 
 /// The program's CPU list and whether it may widen it to every CPU.
-fn affinity(sb: &Sandbox, d: &Dir) -> (vssb::Via, String) {
+fn affinity(sb: &Sandbox, d: &Dir) -> (vssl::Via, String) {
     let code = "import os\n\
         mine = sorted(os.sched_getaffinity(0))\n\
         try:\n    os.sched_setaffinity(0, range(os.cpu_count())); w = 'widened'\n\
@@ -1180,26 +1180,26 @@ fn cpus_without_a_cgroup_pin() {
     };
     // Rounded to the nearest whole number, at least 1.
     for (cpus, n) in [(0.3, 1), (1.4, 1), (1.6, 2)] {
-        let (via, out) = pinned(vssb::CpuMethod::Pin, cpus, true);
+        let (via, out) = pinned(vssl::CpuMethod::Pin, cpus, true);
         let (list, widen) = out.split_once(' ').unwrap();
         assert_eq!(list.split(',').count(), n, "{cpus}: {out}");
-        assert_eq!(via, vssb::Via::Pinned { cpus: list.split(',').map(|c| c.parse().unwrap()).collect(), forced: false });
+        assert_eq!(via, vssl::Via::Pinned { cpus: list.split(',').map(|c| c.parse().unwrap()).collect(), forced: false });
         assert_eq!(widen, "widened", "plain pinning is a hint");
     }
-    let (via, out) = pinned(vssb::CpuMethod::PinForced, 1.0, false);
-    assert!(out.ends_with("denied") && matches!(via, vssb::Via::Pinned { forced: true, .. }), "{out}");
+    let (via, out) = pinned(vssl::CpuMethod::PinForced, 1.0, false);
+    assert!(out.ends_with("denied") && matches!(via, vssl::Via::Pinned { forced: true, .. }), "{out}");
     // Auto: forced in strict mode, plain without it.
-    assert!(pinned(vssb::CpuMethod::Auto, 1.0, true).1.ends_with("denied"));
-    assert!(pinned(vssb::CpuMethod::Auto, 1.0, false).1.ends_with("widened"));
+    assert!(pinned(vssl::CpuMethod::Auto, 1.0, true).1.ends_with("denied"));
+    assert!(pinned(vssl::CpuMethod::Auto, 1.0, false).1.ends_with("widened"));
 }
 
 #[test]
 fn cpu_lists() {
     let d = Dir::new();
     let mut sb = no_cgroup(&d);
-    sb.limits(Limits { cpus: Some(1.0), cpu_method: vssb::CpuMethod::Pin, cpu_choice: vssb::CpuChoice::List(vec![0]), ..Default::default() });
+    sb.limits(Limits { cpus: Some(1.0), cpu_method: vssl::CpuMethod::Pin, cpu_choice: vssl::CpuChoice::List(vec![0]), ..Default::default() });
     assert!(affinity(&sb, &d).1.starts_with("0 "));
-    sb.limits(Limits { cpus: Some(1.0), cpu_method: vssb::CpuMethod::Pin, cpu_choice: vssb::CpuChoice::List(vec![100_000]), ..Default::default() });
+    sb.limits(Limits { cpus: Some(1.0), cpu_method: vssl::CpuMethod::Pin, cpu_choice: vssl::CpuChoice::List(vec![100_000]), ..Default::default() });
     assert!(matches!(sb.spawn(sh(&d, "true")), Err(Error::Config(_))));
 }
 
@@ -1213,7 +1213,7 @@ fn freeze_with_signals() {
     let d = Dir::new();
     let ticks = d.0.join("ticks");
     let mut sb = no_cgroup(&d);
-    sb.freeze_method(vssb::FreezeMethod::Auto);
+    sb.freeze_method(vssl::FreezeMethod::Auto);
     let mut child = sb.spawn(sh(&d, "sh -c 'while :; do echo x >> ticks; sleep 0.02; done' & wait")).unwrap();
     assert!(eventually(|| lines(&ticks) > 2));
     child.freeze(true).unwrap();
@@ -1229,7 +1229,7 @@ fn freeze_with_signals() {
     child.wait().unwrap();
 
     let mut sb = no_cgroup(&d);
-    sb.freeze_method(vssb::FreezeMethod::Cgroup);
+    sb.freeze_method(vssl::FreezeMethod::Cgroup);
     let child = sb.spawn(sh(&d, "sleep 5")).unwrap();
     assert_eq!(child.freeze(true).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
 }

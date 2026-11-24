@@ -124,8 +124,8 @@ The check runs at every start: vssr lists the globals through the new
 socket and refuses (or warns, with `insecure_wayland`) if a privileged
 one appears. That check is also the main integration test.
 
-**Built (2026-11-07).** The protocol code is `vssb::wayland` (a
-host-side helper like `vssb::proxy`, so embedders get it too):
+**Built (2026-11-07).** The protocol code is `vssl::wayland` (a
+host-side helper like `vssl::proxy`, so embedders get it too):
 `Context::create` binds the listener through the pinned directory,
 creates the context, lists the globals through it, and `escapes()`
 names those of `ESCAPES` still offered: the capture, data-control,
@@ -209,7 +209,7 @@ connect to exactly that file:
   build-cache daemon), with a warning in the README that each socket is
   a capability handed to the program.
 
-Done on 2026-11-07: `vssb::Mount::socket` (`MountKind::Socket`), mounted
+Done on 2026-11-07: `vssl::Mount::socket` (`MountKind::Socket`), mounted
 read-only with a Landlock rule granting only the connect right, and
 `fs.sockets` / `--socket` in vssr. Before ABI 9 Landlock can't restrict
 unix sockets, so the entry is simply a bind there.
@@ -371,7 +371,7 @@ running:
 
 - A client inside sees no screencopy, data-control or virtual-input
   globals; vssr refuses to start where the compositor would leak them.
-  (In place since 2026-11-07, run with `VSSB_TEST_WAYLAND` /
+  (In place since 2026-11-07, run with `VSSL_TEST_WAYLAND` /
   `VSSR_TEST_WAYLAND`; the refusal itself only has a unit test, since
   neither sway nor Hyprland leaks.)
 - The session's own Wayland socket and the session bus are unreachable

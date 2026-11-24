@@ -232,7 +232,7 @@ apid=$!
 for _ in $(seq 100); do grep -q swapping "$WORK/race-a.out" && break; sleep 0.1; done
 if grep -q swapping "$WORK/race-a.out"; then
     # B binds R/x (swapped itself) and R/p/x (a directory above it swapped).
-    # vssr refuses a symlink it sees; vssb one swapped in after that.
+    # vssr refuses a symlink it sees; vssl one swapped in after that.
     real=0 policy=0 child=0 leaked=0 other=
     for i in $(seq 400); do
         out=$(cd "$R" && "$V" run --ro "$R/x:/mnt/x" --ro "$R/p/x:/mnt/y" -- cat /mnt/x/f /mnt/y/f 2>"$WORK/race-b.err"); code=$?
@@ -244,7 +244,7 @@ if grep -q swapping "$WORK/race-a.out"; then
         else other="exit $code: $out $err"; fi
         [ $real -gt 0 ] && [ $policy -gt 0 ] && [ $child -gt 0 ] && [ $i -ge 30 ] && break
     done
-    counts="$real exposed, $policy refused by vssr, $child refused by vssb, $leaked leaked"
+    counts="$real exposed, $policy refused by vssr, $child refused by vssl, $leaked leaked"
     [ $leaked = 0 ] && [ -z "$other" ] && ok "binds can't be redirected by another sandbox ($counts)" \
         || bad "binds can't be redirected by another sandbox" "$counts; $other"
     [ $real -gt 0 ] && [ $policy -gt 0 ] && [ $child -gt 0 ] && ok "  ...which raced both checks" \

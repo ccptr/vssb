@@ -8,7 +8,7 @@
 //! fresh tmpfs becomes the new root, mounts are attached under it
 //! parent-first, and mount points are looked up with
 //! openat2(RESOLVE_NO_SYMLINKS) so no symlink can redirect a mount. Mount
-//! points and symlinks are only ever created in filesystems vssb made
+//! points and symlinks are only ever created in filesystems vssl made
 //! itself, never inside a bind mount (that would write to the host).
 
 use crate::prepare::{POp, PMount, Prepared};
@@ -121,7 +121,7 @@ enum Kind {
     Any,
 }
 
-/// Whether vssb may create a missing entry below the first `k` components
+/// Whether vssl may create a missing entry below the first `k` components
 /// of mount `i`'s path: that depends on the deepest attached mount above
 /// it. Returns (creatable, index of that mount or NONE for the root).
 fn owner(mounts: &[PMount], regions: &[u8], i: usize, k: usize) -> (bool, u32) {

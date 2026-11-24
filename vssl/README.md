@@ -1,4 +1,4 @@
-# vssb
+# vssl
 
 The sandbox core of [vssr](../vssr) as a library you can embed: run a
 program in a rootless Linux sandbox (namespaces, Landlock, seccomp, cgroup
@@ -9,7 +9,7 @@ it uses to ask the systemd user manager for a scope (from the ossteam
 repository, checked out next to this one).
 
 ```rust
-use vssb::{Command, Limits, Mount, Sandbox, Stdio};
+use vssl::{Command, Limits, Mount, Sandbox, Stdio};
 
 let mut sb = Sandbox::new();
 sb.system(true)                                  // ro /usr, /etc…; fresh /tmp, /proc, /dev
@@ -63,7 +63,7 @@ are the guarantees towards the host, each with an integration test in
   `systemd-run`.
 - **Your `waitpid(-1)` can't steal it.** The sandbox is a "clone child"
   (no exit signal): it sends no SIGCHLD and only `__WALL` waits see it.
-  vssb starts no other process, so there is nothing else to steal.
+  vssl starts no other process, so there is nothing else to steal.
   `Child` waits on its pidfd, which can also go into your poll loop or
   async runtime (`Child::pidfd`).
 - **It dies with your process, not with a thread.** Init holds one end of
@@ -73,7 +73,7 @@ are the guarantees towards the host, each with an integration test in
 - **No leaked descriptors.** Init closes every descriptor except its own
   as its first step, so other threads' sockets and pipes don't stay open
   in it. The program gets stdio and the descriptors you pass
-  (`Command::pass_fd`), nothing else. If you have 0-2 closed, vssb keeps
+  (`Command::pass_fd`), nothing else. If you have 0-2 closed, vssl keeps
   its own descriptors off them, and `Stdio::Inherit` gives `/dev/null`.
 - **Explicit inputs.** Nothing is read from the host process: no
   environment (the program's environment starts empty), no current
@@ -143,7 +143,7 @@ writes the events to its audit log.
 
 ## Limits without a cgroup
 
-vssb uses systemd only where nothing else will do, and falls back where
+vssl uses systemd only where nothing else will do, and falls back where
 it reasonably can. When the sandbox gets no cgroup (no systemd user
 manager, or `Cgroup::Inherit`), or a controller isn't in effect in it:
 
@@ -188,7 +188,7 @@ and run sandboxes on many threads at once. The limit and freeze tests
 through a systemd scope are skipped without a systemd user manager; the
 fallback tests always run (the pids one is skipped on kernels without a
 per-namespace `pid_max`). They don't need internet access. The Wayland
-test runs only with `VSSB_TEST_WAYLAND` naming a headless compositor's
+test runs only with `VSSL_TEST_WAYLAND` naming a headless compositor's
 socket (see vssr's README), never the live session's.
 
 ## License

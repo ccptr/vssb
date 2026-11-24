@@ -1,4 +1,4 @@
-# vssb: notes for agents
+# vssl: notes for agents
 
 Embeddable rootless Linux sandbox: vssr's core as a library. See
 README.md for the design and the guarantees towards the host program.
@@ -46,9 +46,9 @@ README.md for the design and the guarantees towards the host program.
   fallbacks they get is the user's decision (see the root AGENTS.md).
 - Mount points, and bind sources (in the child, before `open_tree`), are
   opened with `openat2(RESOLVE_NO_SYMLINKS)`, a symlink as the final
-  component is refused too, and vssb never creates entries (mount points
+  component is refused too, and vssl never creates entries (mount points
   or symlinks) inside a bind mount (that would write to the host).
-- Descriptors vssb opens are kept off 0-2 (`prepare::above_stdio`), so a
+- Descriptors vssl opens are kept off 0-2 (`prepare::above_stdio`), so a
   caller with stdio closed doesn't hand them to the program as stdio.
 - In the program's process, seccomp is installed last, right before exec.
 - seccomp jumps are 8-bit: keep the final ALLOW reachable, and keep
@@ -60,5 +60,5 @@ README.md for the design and the guarantees towards the host program.
 
 `cargo test`. Add an end-to-end test in `tests/sandbox.rs` for every new
 guarantee. Tests run in parallel threads on purpose. Wayland tests talk
-only to the compositor `VSSB_TEST_WAYLAND` names (a headless one), never
+only to the compositor `VSSL_TEST_WAYLAND` names (a headless one), never
 to the session's `$WAYLAND_DISPLAY`.

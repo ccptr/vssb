@@ -12,7 +12,7 @@ const AUDIT_ARCH: u32 = 0xC000_003E;
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH: u32 = 0xC000_00B7;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!("vssb's seccomp filter supports x86_64 and aarch64 only");
+compile_error!("vssl's seccomp filter supports x86_64 and aarch64 only");
 
 const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_KILL_PROCESS: u32 = 0x8000_0000;

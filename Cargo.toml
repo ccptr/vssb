@@ -1,5 +1,5 @@
 [workspace]
-members = ["dbus-proxy", "vssb", "vssr"]
+members = ["dbus-proxy", "vssl", "vssr"]
 resolver = "3"
 
 [workspace.package]

@@ -2,7 +2,7 @@
 
 pkgname=vssr
 # No release is tagged yet: a snapshot of both repositories, versioned as
-# vssr-git would version it. To update, set the commits and pkgver (vssb's
+# vssr-git would version it. To update, set the commits and pkgver (vss's
 # `git rev-list --count` and short hash), then run updpkgsums.
 _commit=6f485e6aa4a6c13479721b5d64a19997c8f97f91
 _ossteam_commit=23b7cbfd41958e3d90ffd22ddfe8fdb1537bd775
@@ -11,34 +11,34 @@ pkgrel=1
 pkgdesc='Rootless Linux sandbox for running agents unattended: namespaces, Landlock, seccomp, filtered network and D-Bus'
 arch=('x86_64' 'aarch64')
 url='https://github.com/ccptr/vss'
-# vssr and vssb are MPL-2.0; ossteam-dbus, linked in statically, LGPL-2.1-or-later.
+# vssr and vssl are MPL-2.0; ossteam-dbus, linked in statically, LGPL-2.1-or-later.
 license=('MPL-2.0' 'LGPL-2.1-or-later')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo' 'git')
-# vssb's Cargo.toml takes ossteam-dbus from ../ossteam, next to the checkout.
-source=("vssb::git+https://github.com/ccptr/vss.git#commit=$_commit"
+# vssl's Cargo.toml takes ossteam-dbus from ../ossteam, next to the checkout.
+source=("vss::git+https://github.com/ccptr/vss.git#commit=$_commit"
         "ossteam::git+https://github.com/ccptr/OSSteam.git#commit=$_ossteam_commit")
 sha256sums=('441fd5153f9fe744bc0973d75cc2657ca58edafc5c8fe3230c70d35750c99206'
             'ea3bd9965cc65067dcb2ce29ffd3ff07586d0f07c9a07e21de61fad4ab68f864')
 
 prepare() {
-  cd vssb
+  cd vss
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc --print host-tuple)"
 }
 
 build() {
-  cd vssb
+  cd vss
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release -p vssr
 }
 
 check() {
-  cd vssb
+  cd vss
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  # Only vssr's unit tests: vssb's and the end-to-end ones need user
+  # Only vssr's unit tests: vssl's and the end-to-end ones need user
   # namespaces, which a clean chroot may not allow. One unit test reads the
   # session bus's address from the environment (it connects to nothing).
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
@@ -46,7 +46,7 @@ check() {
 }
 
 package() {
-  cd vssb
+  cd vss
   install -Dm755 target/release/vssr -t "$pkgdir/usr/bin"
   install -Dm644 vssr/README.md -t "$pkgdir/usr/share/doc/vssr"
   install -Dm644 vssr/examples/*.toml -t "$pkgdir/usr/share/doc/vssr/examples"

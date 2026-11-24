@@ -1,6 +1,6 @@
 //! cgroup placement. An unprivileged process can't move another process
 //! into a cgroup it may configure, but the systemd user manager can: after
-//! clone, while the child waits, vssb asks it over D-Bus (a blocking call
+//! clone, while the child waits, vssl asks it over D-Bus (a blocking call
 //! on the caller's thread, no subprocess) for a transient scope holding the
 //! child, with the limits as properties. The child then makes that scope
 //! the root of its cgroup namespace.
@@ -95,7 +95,7 @@ fn start_scope(pid: i32, unit: &str, l: &Limits) -> Message {
     let prop = |name: &str, v: Value| Value::Struct(vec![Value::Str(name.into()), Value::Variant(Box::new(v))]);
     let mut props = vec![
         prop("PIDs", Value::Array(Type::U32, vec![Value::U32(pid as u32)])),
-        prop("Description", Value::Str("vssb sandbox".into())),
+        prop("Description", Value::Str("vssl sandbox".into())),
         prop("CollectMode", Value::Str("inactive-or-failed".into())),
     ];
     if let Some(m) = l.memory {
@@ -171,10 +171,10 @@ mod tests {
             true
         });
         let l = Limits { memory: Some(64 << 20), cpus: Some(1.5), pids: Some(32), ..Default::default() };
-        let call = start_scope(1234, "vssb-x.scope", &l);
+        let call = start_scope(1234, "vssl-x.scope", &l);
         assert_eq!(call.destination.as_deref(), Some(SYSTEMD));
         assert_eq!(call.member.as_deref(), Some("StartTransientUnit"));
-        assert_eq!(&call.body[..2], &[Value::Str("vssb-x.scope".into()), Value::Str("fail".into())]);
+        assert_eq!(&call.body[..2], &[Value::Str("vssl-x.scope".into()), Value::Str("fail".into())]);
         assert_eq!(property(&call, "PIDs"), Some(&Value::Array(Type::U32, vec![Value::U32(1234)])));
         assert_eq!(property(&call, "MemoryMax"), Some(&Value::U64(64 << 20)));
         assert_eq!(property(&call, "MemorySwapMax"), Some(&Value::U64(0)));
@@ -184,7 +184,7 @@ mod tests {
         // It encodes, and a bus takes it.
         assert!(bus.call(call).is_ok());
         // Without limits: no limit properties.
-        let call = start_scope(1, "vssb-y.scope", &Limits::default());
+        let call = start_scope(1, "vssl-y.scope", &Limits::default());
         assert!(property(&call, "MemoryMax").is_none() && property(&call, "TasksMax").is_none());
         assert!(property(&call, "CollectMode").is_some());
     }
@@ -195,7 +195,7 @@ mod tests {
             out.push(ossteam_dbus::test_bus::error(m, "org.freedesktop.systemd1.UnitExists"));
             true
         });
-        let e = bus.call(start_scope(1, "vssb-z.scope", &Limits::default())).expect_err("error reply");
+        let e = bus.call(start_scope(1, "vssl-z.scope", &Limits::default())).expect_err("error reply");
         assert!(e.to_string().contains("UnitExists"), "{e}");
     }
 
@@ -203,7 +203,7 @@ mod tests {
     fn check(files: &[(&str, &str)], l: &Limits) -> InEffect {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!("vssb-cgroup-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let dir = std::env::temp_dir().join(format!("vssl-cgroup-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&dir).unwrap();
         for (f, v) in files {
             std::fs::write(dir.join(f), format!("{v}\n")).unwrap();

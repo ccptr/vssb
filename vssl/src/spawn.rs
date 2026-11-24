@@ -119,7 +119,7 @@ fn spawn(sb: &Sandbox, cmd: Command) -> Result<Child> {
         let os = io::Error::from_raw_os_error(e);
         match e {
             libc::EPERM | libc::EINVAL | libc::ENOSPC | libc::EUSERS => {
-                Error::Unsupported(format!("creating namespaces: {os} (are unprivileged user namespaces enabled? see vssb::probe)"))
+                Error::Unsupported(format!("creating namespaces: {os} (are unprivileged user namespaces enabled? see vssl::probe)"))
             }
             _ => Error::io("clone", os),
         }

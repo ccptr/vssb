@@ -1,5 +1,5 @@
 //! Policy files (TOML) and their resolution into a concrete [`Plan`],
-//! which maps onto a vssb [`Sandbox`] and [`Command`].
+//! which maps onto a vssl [`Sandbox`] and [`Command`].
 
 use crate::util::{expand, expand_path, parse_duration, parse_size, resolve_guarded};
 use anyhow::{Context, Result, bail};
@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use vssb::proxy::NetPolicy;
-use vssb::{Command, Limits, Mount, MountKind, Net, Resource, Sandbox};
+use vssl::proxy::NetPolicy;
+use vssl::{Command, Limits, Mount, MountKind, Net, Resource, Sandbox};
 
 /// The policy used when none is given. `vssr policy` prints it.
 pub const DEFAULT_POLICY: &str = r#"# vssr default policy: the current directory is writable, the home
@@ -403,9 +403,9 @@ pub struct Plan {
     pub memory: Option<u64>,
     pub cpus: Option<f64>,
     pub pids: Option<u64>,
-    pub cpu_method: vssb::CpuMethod,
-    pub cpu_choice: vssb::CpuChoice,
-    pub pids_method: vssb::PidsMethod,
+    pub cpu_method: vssl::CpuMethod,
+    pub cpu_choice: vssl::CpuChoice,
+    pub pids_method: vssl::PidsMethod,
     /// An existing cgroup v2 directory to start in (`--cgroup`) instead of
     /// a systemd user scope.
     pub cgroup: Option<PathBuf>,
@@ -855,20 +855,20 @@ impl Plan {
             cpus: limits.cpus,
             pids: limits.pids,
             cpu_method: match limits.cpu_method {
-                CpuMethodCfg::Auto => vssb::CpuMethod::Auto,
-                CpuMethodCfg::Cgroup => vssb::CpuMethod::Cgroup,
-                CpuMethodCfg::Pin => vssb::CpuMethod::Pin,
-                CpuMethodCfg::PinForced => vssb::CpuMethod::PinForced,
+                CpuMethodCfg::Auto => vssl::CpuMethod::Auto,
+                CpuMethodCfg::Cgroup => vssl::CpuMethod::Cgroup,
+                CpuMethodCfg::Pin => vssl::CpuMethod::Pin,
+                CpuMethodCfg::PinForced => vssl::CpuMethod::PinForced,
             },
             cpu_choice: match &limits.cpu_choice {
-                CpuChoiceCfg::Name(CpuChoiceName::Spread) => vssb::CpuChoice::Spread,
-                CpuChoiceCfg::Name(CpuChoiceName::Pack) => vssb::CpuChoice::Pack,
-                CpuChoiceCfg::List(l) => vssb::CpuChoice::List(l.clone()),
+                CpuChoiceCfg::Name(CpuChoiceName::Spread) => vssl::CpuChoice::Spread,
+                CpuChoiceCfg::Name(CpuChoiceName::Pack) => vssl::CpuChoice::Pack,
+                CpuChoiceCfg::List(l) => vssl::CpuChoice::List(l.clone()),
             },
             pids_method: match limits.pids_method {
-                PidsMethodCfg::Auto => vssb::PidsMethod::Auto,
-                PidsMethodCfg::Cgroup => vssb::PidsMethod::Cgroup,
-                PidsMethodCfg::PidNamespace => vssb::PidsMethod::PidNamespace,
+                PidsMethodCfg::Auto => vssl::PidsMethod::Auto,
+                PidsMethodCfg::Cgroup => vssl::PidsMethod::Cgroup,
+                PidsMethodCfg::PidNamespace => vssl::PidsMethod::PidNamespace,
             },
             cgroup: None,
             nofile: limits.nofile,
@@ -888,8 +888,8 @@ impl Plan {
     }
 
     /// The sandbox this plan describes. The view is complete already, so
-    /// vssb's own system view stays off. Bind and socket sources are canonical and
-    /// checked, so vssb refuses any symlink in them (one planted since).
+    /// vssl's own system view stays off. Bind and socket sources are canonical and
+    /// checked, so vssl refuses any symlink in them (one planted since).
     pub fn sandbox(&self) -> Sandbox {
         let mut sb = Sandbox::new();
         sb.mounts(self.mounts.iter().map(|m| match m.kind {
@@ -909,7 +909,7 @@ impl Plan {
                 pids_method: self.pids_method,
             });
         if let Some(c) = &self.cgroup {
-            sb.cgroup(vssb::Cgroup::Join(c.clone()));
+            sb.cgroup(vssl::Cgroup::Join(c.clone()));
         }
         match self.net_mode {
             NetMode::Host => sb.net(Net::Host),
@@ -1012,7 +1012,7 @@ impl Plan {
                 "cpus": self.cpus,
                 "cpu_method": method(&self.cpu_method),
                 "cpu_choice": match &self.cpu_choice {
-                    vssb::CpuChoice::List(l) => json!(l),
+                    vssl::CpuChoice::List(l) => json!(l),
                     c => json!(method(c)),
                 },
                 "pids": self.pids,
@@ -1239,7 +1239,7 @@ fn resolve_source(src: &Path, dest: &Path, writable: &[PathBuf]) -> Result<Optio
     Ok(resolve_guarded(src, writable)?.map(|src| MountKind::Bind { src, writable: false }))
 }
 
-/// vssb's system view (read-only /usr, /etc…, fresh /tmp, /proc, /dev),
+/// vssl's system view (read-only /usr, /etc…, fresh /tmp, /proc, /dev),
 /// resolved, so policy entries and detection can be checked against it.
 fn system_mounts(net: NetMode) -> Result<Vec<Mount>> {
     let mut sb = Sandbox::new();
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_reach_vssb_without_symlinks() {
+    fn binds_reach_vssl_without_symlinks() {
         let base = alias_fixture("nosym");
         let plan = plan_with(&base, "real/work", &[(FsKind::Rw, "@/alias/work"), (FsKind::Ro, "@/sentinel"), (FsKind::Tmpfs, "/tmp")]).unwrap();
         let binds: Vec<_> = plan.sandbox().resolved_mounts().unwrap().into_iter().filter(|m| matches!(m.kind, MountKind::Bind { .. })).collect();

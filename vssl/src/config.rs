@@ -94,7 +94,7 @@ impl Mount {
     }
 
     /// A symlink at `dest`. Like mount points, it is only created in
-    /// filesystems vssb made, never inside a bind mount (the host's).
+    /// filesystems vssl made, never inside a bind mount (the host's).
     pub fn symlink(dest: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Mount {
         Mount::new(dest, MountKind::Symlink { target: target.into() })
     }
@@ -271,7 +271,7 @@ pub enum Cgroup {
     /// Always the caller's cgroup. Only limits with a fallback (cpus,
     /// pids) can be set.
     Inherit,
-    /// A new transient systemd user scope (`vssb-<id>.scope`), created
+    /// A new transient systemd user scope (`vssl-<id>.scope`), created
     /// over D-Bus (no subprocess), even without limits (for
     /// [`Child::freeze`](crate::Child::freeze) through the cgroup). In
     /// strict mode, failing to create it is an error.

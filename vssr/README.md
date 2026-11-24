@@ -40,9 +40,9 @@ resolves.
 - For a memory limit: a systemd user manager, or a cgroup
   you prepared (`--cgroup`). Without either,
   `cpus` pins the sandbox to that many CPUs and `pids` sizes its PID
-  namespace (Linux 6.14+) instead; see vssb's README for the details.
+  namespace (Linux 6.14+) instead; see vssl's README for the details.
 
-The sandbox itself is built by [vssb](../vssb), the library crate next to
+The sandbox itself is built by [vssl](../vssl), the library crate next to
 vssr in this workspace; it needs the ossteam repository checked out next
 to this one (`../ossteam`, for `ossteam-dbus`). Build with `cargo build --release` from the
 workspace root; the binary is `target/release/vssr` there.
@@ -390,15 +390,15 @@ Think about what you expose, not only what you block.
 `vssr run` (the supervisor) resolves the policy into a plan: it expands
 paths, runs the detectors, resolves symlinks and checks the writable
 directories, and merges everything into one mount list, with every bind
-source canonical (vssb then refuses a symlink in it, so one planted after
+source canonical (vssl then refuses a symlink in it, so one planted after
 the check fails the run instead of redirecting a bind). It hands that
-list, with the rest of the plan, to [vssb](../vssb), which does the
+list, with the rest of the plan, to [vssl](../vssl), which does the
 sandboxing:
 
-1. vssb `clone`s a child into new user, mount, PID, network, IPC and UTS
+1. vssl `clone`s a child into new user, mount, PID, network, IPC and UTS
    namespaces and writes its uid/gid maps. With limits, it asks the
    systemd user manager over D-Bus for a transient scope
-   (`vssb-<id>.scope`) holding the child, then the child enters a new
+   (`vssl-<id>.scope`) holding the child, then the child enters a new
    cgroup namespace rooted there. Without a scope, init applies the
    fallbacks instead (CPU pinning, the PID namespace's size), and the
    audit `start` event's `limits` says which applied;

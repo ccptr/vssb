@@ -3,7 +3,7 @@
 
 use crate::policy::Plan;
 use anyhow::Result;
-use vssb::seccomp::Filter;
+use vssl::seccomp::Filter;
 
 pub fn run(json: bool, plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
     if json {
@@ -15,7 +15,7 @@ pub fn run(json: bool, plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
         println!("{} {name:<16} {detail}", if good { " ok " } else { "FAIL" });
     };
 
-    let s = vssb::probe();
+    let s = vssl::probe();
     line(true, "kernel", s.kernel.clone());
     line(s.user_namespaces, "user namespaces", "unprivileged user, mount, PID and network namespaces".into());
 
@@ -53,7 +53,7 @@ pub fn run(json: bool, plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
 /// `vssr check --json`: the same facts for programs. `ok` is false when the
 /// default (strict) settings can't start or the policy doesn't resolve.
 fn run_json(plan: impl FnOnce() -> Result<Plan>) -> Result<i32> {
-    let s = vssb::probe();
+    let s = vssl::probe();
     let f = Filter::build(&[], &[])?;
     let mut ok = s.user_namespaces && s.landlock_abi > 0 && s.seccomp;
     let mut out = serde_json::json!({

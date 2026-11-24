@@ -433,9 +433,9 @@ mod tests {
     fn escapes_are_the_privileged_globals_offered() {
         let dir = std::env::temp_dir();
         let ctx = Context {
-            socket: dir.join("vssb-none"),
+            socket: dir.join("vssl-none"),
             dir: open_dir(&std::fs::canonicalize(&dir).unwrap()).unwrap(),
-            name: c"vssb-wayland-test-none".into(),
+            name: c"vssl-wayland-test-none".into(),
             close: None,
             globals: ["wl_compositor", "zwlr_screencopy_manager_v1", "zwp_virtual_keyboard_manager_v1", "ext_idle_notifier_v1"].map(String::from).to_vec(),
         };
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn compositors_without_security_contexts_are_unsupported() {
-        let dir = std::env::temp_dir().join(format!("vssb-wl-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vssl-wl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();

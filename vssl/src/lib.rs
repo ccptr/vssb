@@ -1,4 +1,4 @@
-//! vssb: a rootless Linux sandbox you can embed in another program.
+//! vssl: a rootless Linux sandbox you can embed in another program.
 //!
 //! A [`Sandbox`] describes the environment (filesystem view, network,
 //! syscall filter, ids, resource limits); a [`Command`] describes one
@@ -6,7 +6,7 @@
 //! [`Child`] handle, much like `std::process`:
 //!
 //! ```no_run
-//! use vssb::{Command, Mount, Sandbox, Stdio};
+//! use vssl::{Command, Mount, Sandbox, Stdio};
 //!
 //! let mut sb = Sandbox::new();
 //! sb.system(true).mount(Mount::rw("/home/me/project"));
@@ -27,7 +27,7 @@
 #![allow(clippy::unnecessary_cast)]
 
 #[cfg(not(target_os = "linux"))]
-compile_error!("vssb only supports Linux");
+compile_error!("vssl only supports Linux");
 
 mod cgroup;
 mod child;

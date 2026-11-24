@@ -123,7 +123,7 @@ pub(crate) fn to_error(r: Report, cx: &Context) -> Error {
             // missing entry is the mount point or symlink itself.
             let missing = prefix(&d, r.b);
             let what = if missing == d { String::new() } else { format!("setting up {shown}: ") };
-            format!("{what}{} does not exist inside {} (a host directory), and vssb won't create it there", missing.display(), dest(r.c).display())
+            format!("{what}{} does not exist inside {} (a host directory), and vssl won't create it there", missing.display(), dest(r.c).display())
         }
         SYMLINK_IN_PATH => format!("{} is a symlink; mount paths can't pass through symlinks (use the real path)", prefix(&d, r.b).display()),
         NOT_DIR => format!("{} is not a directory", prefix(&d, r.b).display()),

@@ -1,7 +1,7 @@
-# Design note: embedding vssb and vssr in another program
+# Design note: embedding vssl and vssr in another program
 
 Status: audit, 2026-11-06, of the workspace at commit f636985. It
-replaces the audit of 2026-11-05 (vssr at 038e9e7), written before vssb
+replaces the audit of 2026-11-05 (vssr at 038e9e7), written before vssl
 existed, which found in-process use unworkable. Example host: a new
 Steam-like game client that launches each game in a sandbox. GUI support
 is covered in [gui.md](gui.md).
@@ -9,7 +9,7 @@ is covered in [gui.md](gui.md).
 ## Verdict
 
 - **As a library inside the client process: workable.** That is what
-  [vssb](../../../vssb) is for. It can be called from any thread of a
+  [vssl](../../../vssl) is for. It can be called from any thread of a
   multi-threaded host, takes over no process-wide state, and gives the
   host typed errors, a pidfd and per-run cleanup. What's missing for a
   general host is a C API (it is Rust only) and a policy layer above
@@ -23,14 +23,14 @@ is covered in [gui.md](gui.md).
   devices and no filtered UDP, and container runtimes like the Steam
   Linux Runtime can't run inside it. `gui.md` covers part of this
   (Wayland, D-Bus, GPU, audio); none of it is implemented yet.
-- **License: MPL-2.0.** A closed-source client can link vssb, statically
-  or not. Changes to vssb's own files stay under the MPL. vssb links
+- **License: MPL-2.0.** A closed-source client can link vssl, statically
+  or not. Changes to vssl's own files stay under the MPL. vssl links
   `ossteam-dbus`, which is LGPL-2.1-or-later until it is relicensed; until
   then static linking also means allowing relinking against it.
 
-## 1. In-process embedding (linking vssb)
+## 1. In-process embedding (linking vssl)
 
-What a host gets (details and the test for each in vssb's README):
+What a host gets (details and the test for each in vssl's README):
 
 - `Sandbox::spawn` from any thread, from many at once. The child of the
   fork-like `clone3` makes only raw syscalls, so locks held by other
@@ -65,10 +65,10 @@ Gaps for a host:
 
 | Gap | Where | Why it matters |
 |---|---|---|
-| Rust only: no C ABI, no `cdylib` | `vssb/src/lib.rs` | A C or C++ client needs a small FFI crate (opaque `Sandbox`, `Command` and `Child` handles, the pidfd, errors as codes and strings). |
+| Rust only: no C ABI, no `cdylib` | `vssl/src/lib.rs` | A C or C++ client needs a small FFI crate (opaque `Sandbox`, `Command` and `Child` handles, the pidfd, errors as codes and strings). |
 | No policy layer in the library | `vssr/src/policy.rs` | vssr's `Policy` → `Plan` lives in the binary crate. `Plan::build` takes the working and home directories as arguments, but reads the environment (`$VAR` in paths, `env.pass`) and the uid itself. A host that wants vssr's policy files would need it split out with explicit inputs. A host with its own configuration builds a `Sandbox` directly and needs none of it. |
-| AppArmor on Ubuntu 24.04+ | vssb README | Unprivileged user namespaces need a profile for the binary that creates them, so in-process use puts the whole client under that profile. A helper binary keeps the profile small. |
-| Forking without exec during a spawn | vssb README | The forked copy keeps the control socket open, so `spawn` waits until it exits or execs (`std::process` has the same property). |
+| AppArmor on Ubuntu 24.04+ | vssl README | Unprivileged user namespaces need a profile for the binary that creates them, so in-process use puts the whole client under that profile. A helper binary keeps the profile small. |
+| Forking without exec during a spawn | vssl README | The forked copy keeps the control socket open, so `spawn` waits until it exits or execs (`std::process` has the same property). |
 
 ## 2. Subprocess embedding (the client runs `vssr run …`)
 
@@ -115,17 +115,17 @@ These are properties of the sandbox, so they apply to both routes.
 
 | Need | Today | Where | Notes |
 |---|---|---|---|
-| 32-bit programs (old games, 32-bit Wine/Proton parts, 32-bit helpers) | **Killed**: any syscall not from the native architecture returns `KILL_PROCESS` | `vssb/src/seccomp.rs:206-208` | Not configurable. A fix needs a second branch with the i386 syscall numbers (they differ from x86_64), within the 8-bit jump limit. |
-| Wine/Proton running 16/32-bit code | `modify_ldt` denied | `vssb/src/seccomp.rs:73` | Can be allowed (`Sandbox::seccomp_allow`, or `seccomp.allow` in a vssr policy). |
-| Steam Linux Runtime / pressure-vessel (bubblewrap) | Nested user namespaces and the whole mount family are denied | `vssb/src/seccomp.rs:65-66`, `:228-229` | Allowing them removes much of what seccomp adds. Running the runtime's containers would mean vssb becomes the container runtime, or the runtime sandboxes and vssb doesn't. |
-| GPU (Mesa, Vulkan, NVIDIA) | `/dev` holds only null, zero, full, random, urandom, tty, a private devpts and `/dev/shm`; `/sys` isn't mounted | `vssb/src/mounts.rs:181`, `vssb/src/config.rs:231-235` | gui.md plans render nodes (`gpu = true`). Vulkan and Mesa also need parts of `/sys` (`/sys/dev/char`, `/sys/class/drm`, PCI ids), which no note covers yet. |
-| Wayland / X11 / audio | `/run`, `/tmp` and `/var/tmp` are fresh tmpfs, so there are no `XDG_RUNTIME_DIR` sockets and no `/tmp/.X11-unix`. Binding a socket read-only doesn't help, since Landlock ABI 9 blocks connecting to it | `vssb/src/prepare.rs:165`, `vssb/src/landlock.rs:59` | Planned in gui.md (security-context Wayland, private Xwayland, `fs.sockets`, PipeWire). Games add a latency need: fullscreen and direct scan-out through the compositor. |
-| Controllers and hotplug | No `/dev/input`, `/dev/hidraw*`, `/dev/uinput`. Netlink is limited to ROUTE and SOCK_DIAG, so udev monitors (`NETLINK_KOBJECT_UEVENT`) are refused | `vssb/src/seccomp.rs:251-265`, `vssb/src/mounts.rs:181` | `uinput` is input injection (an escape, like a Wayland virtual keyboard). The client should own the devices and hand the game per-device fds, which `pass_fd` now allows. |
-| Multiplayer networking (UDP, arbitrary ports) | `Net::None` (loopback plus listeners such as the HTTP(S) proxy) or `Net::Host` (unfiltered UDP; Landlock filters TCP ports only) | `vssb/src/config.rs:110-118`, `vssb/src/proxy.rs` | No filtered middle ground. Options: a userspace UDP relay on a listener, like the proxy, or a veth with nftables (needs privileges). |
-| Client ↔ game IPC (Steamworks-style) | Private `/dev/shm`. Abstract unix sockets and signals are scoped by Landlock and by the separate network namespace | `vssb/src/landlock.rs:36-37`, `vssb/src/config.rs:23-25` | Design it as an fd passed in (`pass_fd`) rather than shared memory or a well-known socket. |
-| Crash reports (breakpad, crashpad) | `ptrace` denied | `vssb/src/seccomp.rs:62` | Can be allowed; better done from outside, by the client. |
+| 32-bit programs (old games, 32-bit Wine/Proton parts, 32-bit helpers) | **Killed**: any syscall not from the native architecture returns `KILL_PROCESS` | `vssl/src/seccomp.rs:206-208` | Not configurable. A fix needs a second branch with the i386 syscall numbers (they differ from x86_64), within the 8-bit jump limit. |
+| Wine/Proton running 16/32-bit code | `modify_ldt` denied | `vssl/src/seccomp.rs:73` | Can be allowed (`Sandbox::seccomp_allow`, or `seccomp.allow` in a vssr policy). |
+| Steam Linux Runtime / pressure-vessel (bubblewrap) | Nested user namespaces and the whole mount family are denied | `vssl/src/seccomp.rs:65-66`, `:228-229` | Allowing them removes much of what seccomp adds. Running the runtime's containers would mean vssl becomes the container runtime, or the runtime sandboxes and vssl doesn't. |
+| GPU (Mesa, Vulkan, NVIDIA) | `/dev` holds only null, zero, full, random, urandom, tty, a private devpts and `/dev/shm`; `/sys` isn't mounted | `vssl/src/mounts.rs:181`, `vssl/src/config.rs:231-235` | gui.md plans render nodes (`gpu = true`). Vulkan and Mesa also need parts of `/sys` (`/sys/dev/char`, `/sys/class/drm`, PCI ids), which no note covers yet. |
+| Wayland / X11 / audio | `/run`, `/tmp` and `/var/tmp` are fresh tmpfs, so there are no `XDG_RUNTIME_DIR` sockets and no `/tmp/.X11-unix`. Binding a socket read-only doesn't help, since Landlock ABI 9 blocks connecting to it | `vssl/src/prepare.rs:165`, `vssl/src/landlock.rs:59` | Planned in gui.md (security-context Wayland, private Xwayland, `fs.sockets`, PipeWire). Games add a latency need: fullscreen and direct scan-out through the compositor. |
+| Controllers and hotplug | No `/dev/input`, `/dev/hidraw*`, `/dev/uinput`. Netlink is limited to ROUTE and SOCK_DIAG, so udev monitors (`NETLINK_KOBJECT_UEVENT`) are refused | `vssl/src/seccomp.rs:251-265`, `vssl/src/mounts.rs:181` | `uinput` is input injection (an escape, like a Wayland virtual keyboard). The client should own the devices and hand the game per-device fds, which `pass_fd` now allows. |
+| Multiplayer networking (UDP, arbitrary ports) | `Net::None` (loopback plus listeners such as the HTTP(S) proxy) or `Net::Host` (unfiltered UDP; Landlock filters TCP ports only) | `vssl/src/config.rs:110-118`, `vssl/src/proxy.rs` | No filtered middle ground. Options: a userspace UDP relay on a listener, like the proxy, or a veth with nftables (needs privileges). |
+| Client ↔ game IPC (Steamworks-style) | Private `/dev/shm`. Abstract unix sockets and signals are scoped by Landlock and by the separate network namespace | `vssl/src/landlock.rs:36-37`, `vssl/src/config.rs:23-25` | Design it as an fd passed in (`pass_fd`) rather than shared memory or a well-known socket. |
+| Crash reports (breakpad, crashpad) | `ptrace` denied | `vssl/src/seccomp.rs:62` | Can be allowed; better done from outside, by the client. |
 | Kernel-level anti-cheat | Not possible in any user-namespace sandbox | n/a | Treat as unsupported. |
-| Platform | Linux 6.x with unprivileged user namespaces; x86_64 or aarch64 | vssb README | Ubuntu 24.04+ needs an AppArmor profile (see section 1). Not verified here: whether SteamOS kernels enable Landlock (with `strict`, the default, vssb refuses to run without it). |
+| Platform | Linux 6.x with unprivileged user namespaces; x86_64 or aarch64 | vssl README | Ubuntu 24.04+ needs an AppArmor profile (see section 1). Not verified here: whether SteamOS kernels enable Landlock (with `strict`, the default, vssl refuses to run without it). |
 
 Things that already fit a game launcher well: a read-only install
 directory, read-write save and prefix directories, a tmpfs home, memory,
@@ -140,7 +140,7 @@ left behind, freezing a paused game, and the audit trail.
 2. ~~Limits without a subprocess~~ (done 2026-11-07: the scope comes
    from a D-Bus call through `ossteam-dbus`; relicensing that crate
    for closed-source static linking is pending).
-3. **A C API** (`vssb-ffi`), if a client not written in Rust is meant
+3. **A C API** (`vssl-ffi`), if a client not written in Rust is meant
    to link it.
 4. **Split `Policy` → `Plan` into a library**, with explicit inputs
    (cwd, home, uid/gid, environment), only if hosts want vssr's policy
