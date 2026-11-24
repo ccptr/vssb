@@ -10,13 +10,13 @@ pkgver=0.1.0.r37.g6f485e6
 pkgrel=1
 pkgdesc='Rootless Linux sandbox for running agents unattended: namespaces, Landlock, seccomp, filtered network and D-Bus'
 arch=('x86_64' 'aarch64')
-url='https://github.com/ccptr/vssb'
+url='https://github.com/ccptr/vss'
 # vssr and vssb are MPL-2.0; ossteam-dbus, linked in statically, LGPL-2.1-or-later.
 license=('MPL-2.0' 'LGPL-2.1-or-later')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo' 'git')
 # vssb's Cargo.toml takes ossteam-dbus from ../ossteam, next to the checkout.
-source=("vssb::git+https://github.com/ccptr/vssb.git#commit=$_commit"
+source=("vssb::git+https://github.com/ccptr/vss.git#commit=$_commit"
         "ossteam::git+https://github.com/ccptr/OSSteam.git#commit=$_ossteam_commit")
 sha256sums=('441fd5153f9fe744bc0973d75cc2657ca58edafc5c8fe3230c70d35750c99206'
             'ea3bd9965cc65067dcb2ce29ffd3ff07586d0f07c9a07e21de61fad4ab68f864')
